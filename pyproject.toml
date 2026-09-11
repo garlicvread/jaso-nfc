@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jaso-nfc"
+version = "0.1.0"
+description = "Persistent, event-driven NFC filename normalization for macOS"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "jaso-nfc contributors"}]
+classifiers = [
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Filesystems",
+]
+
+[project.scripts]
+jaso-nfc = "jaso_nfc.cli:main"
+
+[project.urls]
+Repository = "https://github.com/garlicvread/jaso-nfc"
+Issues = "https://github.com/garlicvread/jaso-nfc/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

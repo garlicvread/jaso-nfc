@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="분리된 한글 파일명을 정리하고 선택한 폴더의 새 파일도 자동으로 처리합니다. Jaso NFC를 설치하고 다운로드 폴더에서 시작하세요.">
+  <meta name="theme-color" content="#f8f8f1">
+  <meta property="og:title" content="Jaso NFC — 한글 파일명, 다시 한 이름으로">
+  <meta property="og:description" content="한글 파일명을 정리하고 새 파일도 자동으로 처리하는 Mac 앱입니다. 설치부터 다운로드 폴더 자동 정리까지 안내합니다.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://garlicvread.github.io/jaso-nfc/">
+  <link rel="canonical" href="https://garlicvread.github.io/jaso-nfc/">
+  <link rel="alternate" hreflang="en" href="https://garlicvread.github.io/jaso-nfc/en/">
+  <link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script src="assets/guide.js" defer></script>
+  <title>Jaso NFC — 한글 파일명, 다시 한 이름으로</title>
+</head>
+<body>
+<a class="skip" href="#main">본문으로 이동</a>
+<header class="header">
+  <nav class="nav wrap" aria-label="주 메뉴">
+    <a class="brand" href="./" aria-label="Jaso NFC 처음으로"><img src="assets/mark.svg" alt="" width="36" height="36">Jaso NFC</a>
+    <div class="nav-links"><a href="#setup">시작하기</a><a class="desktop-link" href="#questions">궁금한 점</a><a class="desktop-link" href="https://github.com/garlicvread/jaso-nfc">GitHub ↗</a><a class="language" href="en/" lang="en" hreflang="en">English</a></div>
+  </nav>
+</header>
+<main id="main" class="wrap">
+  <section class="hero" aria-labelledby="hero-title">
+    <div>
+      <p class="eyebrow">한글 파일명 자동 정리 <span>v0.1.0</span></p>
+      <h1 id="hero-title">흩어진 한글,<br><em>다시 한 이름으로.</em></h1>
+      <p class="hero-copy">파일을 주고받다 분리된 한글 파일명을 정리합니다. 선택한 폴더를 감시하며 새로 들어온 파일과 폴더의 이름도 자동으로 정리합니다.</p>
+      <div class="actions"><a class="button" href="https://github.com/garlicvread/jaso-nfc/releases/download/v0.1.0/Jaso-NFC-0.1.0-arm64-local.dmg">다운로드 <span aria-hidden="true">↓</span></a><a class="button secondary" href="#setup">설치 안내</a></div>
+      <p class="compatibility">Apple Silicon Mac · macOS 13 이상 · 무료 / MIT 라이선스</p>
+      <p class="before-download">다운로드 폴더부터 정리해 보세요. <a href="#setup">앱에서 폴더를 고르고 바로 시작할 수 있습니다.</a></p>
+    </div>
+    <div class="art" role="img" aria-label="분리된 한글 자음과 모음을 보고서.pdf라는 파일명으로 합치는 과정을 보여 주는 그림입니다.">
+      <div class="art-top"><span>분리된 이름을 한글 음절로</span><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span></div>
+      <div class="file"><div class="file-label"><span>정리 전 · 분리된 자음과 모음</span><svg viewBox="0 0 22 26" fill="none" aria-hidden="true"><path d="M4 1h9l7 7v17H2V1h2zM13 1v8h7" stroke="currentColor" stroke-width="1.3"/></svg></div><div class="jamo" aria-hidden="true"><span>ᄇ</span><span>ᅩ</span><span>ᄀ</span><span>ᅩ</span><span>ᄉ</span><span>ᅥ</span><small>.pdf</small></div></div>
+      <div class="flow">한글 파일명 정리 <span aria-hidden="true">↓</span></div>
+      <div class="file after"><div class="file-label"><span>정리 후 · 완성된 한글 이름</span><span>JASO NFC</span></div><div class="filename"><span>보고서<small>.pdf</small></span><span class="check" aria-hidden="true">✓</span></div></div>
+      <p class="art-caption">한글 파일명이 합쳐지는 과정을 설명하는 그림입니다.</p>
+    </div>
+  </section>
+  <div class="quick-facts" aria-label="앱의 기본 동작">
+    <div class="fact"><span class="number">01</span><p>한글 파일명 정리<small>분리된 자음과 모음을 한글 음절로</small></p></div>
+    <div class="fact"><span class="number">02</span><p>선택한 폴더 자동 정리<small>새로 들어온 파일도 계속 확인</small></p></div>
+    <div class="fact"><span class="number">03</span><p>처리 상태 확인<small>문제 파일과 다음 조치를 한눈에</small></p></div>
+  </div>
+  <section id="setup" class="section" aria-labelledby="setup-title">
+    <div class="section-heading"><div><p class="eyebrow">시작 안내</p><h2 id="setup-title">다운로드 폴더부터 정리하세요.</h2></div><p class="section-intro">앱을 설치하고 정리할 파일을 확인한 뒤,<br>다운로드 폴더의 자동 정리를 시작하세요.</p></div>
+    <div class="steps">
+      <article><span class="step-num">01단계</span><h3>설치 파일 열기</h3><p>다운로드한 <code>.dmg</code>를 열고 <code>Install Jaso NFC.app</code>을 더블클릭한 뒤 ‘설치’를 누르세요.</p><p class="small">완료되면 설치 파일을 유지하거나 휴지통으로 옮긴 뒤, 설치 창을 닫고 Finder에서 설치 디스크를 추출하세요.</p></article>
+      <article><span class="step-num">02단계</span><h3>변경할 파일 확인하기</h3><p>메뉴 막대의 Jaso NFC → ‘정리할 폴더…’를 여세요. 정리할 폴더를 고른 뒤 ‘파일명 미리보기’에서 현재 이름과 정리 후 이름을 비교해 보세요.</p><p class="small">처음에는 다운로드 폴더부터 시작해 보세요. 필요한 폴더를 더하거나 목록에서 뺄 수 있습니다.</p></article>
+      <article><span class="step-num">03단계</span><h3>자동 정리 시작하기</h3><p>결과를 확인한 뒤 ‘자동 정리 시작’을 누르세요. 선택한 폴더를 정리하고 이후 들어오는 파일도 계속 확인합니다.</p><p class="small">메뉴의 ‘상태 보기…’에서 현재 활동과 확인이 필요한 항목을 볼 수 있습니다.</p></article>
+    </div>
+    <div id="enable" class="setup-box">
+      <div class="setup-intro"><p class="eyebrow">폴더 설정</p><h3>정리할 곳을 직접 고르세요.</h3><p>‘정리할 폴더…’에서 목록을 확인하고 폴더를 추가하거나 제거하세요. 기존에 사용 중이라면 저장된 폴더와 제외 설정을 이어서 사용할 수 있습니다.</p><p><a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.md#change-folders">폴더 선택과 제외 설정 자세히 보기 ↗</a></p></div>
+      <div class="setup-code"><h3>바뀔 이름을 먼저 확인하세요.</h3><p>미리보기에서 현재 이름과 정리 후 이름을 나란히 확인할 수 있습니다. 접근할 수 없는 폴더가 표시되면 안내에 따라 권한이나 연결을 확인하세요.</p><p>준비되면 ‘자동 정리 시작’을 누르세요. 이후에는 메뉴 막대에서 정리를 잠시 멈추거나 이어갈 수 있습니다.</p></div>
+    </div>
+    <div class="permission"><p>폴더 접근 권한이 필요하면 시스템 설정 → 개인정보 보호 및 보안 → 전체 디스크 접근에 응용 프로그램 폴더의 ‘Jaso NFC’를 추가해 허용하세요. 이후 상태 창에서 ‘작업 다시 시작’을 선택하세요.</p><a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.md#permissions">폴더 접근 권한 설정하기 ↗</a></div>
+  </section>
+  <section id="everyday" class="section everyday" aria-labelledby="everyday-title">
+    <div><p class="eyebrow">매일 쓰는 방법</p><h2 id="everyday-title">매일 확인할 일은<br>메뉴 막대에서.</h2><p class="body-copy">Jaso NFC가 선택한 폴더를 계속 살펴봅니다. 메뉴 막대에서 처리 상황을 확인하고, 필요한 시간에 맞춰 정리를 멈추거나 이어가세요.</p></div>
+    <ul class="menu-list"><li>상태 보기<span>현재 활동과 대기 작업을 확인하세요. 문제가 생긴 항목에는 경로와 확인 방법이 표시됩니다.</span></li><li>일시정지·계속 진행<span>다른 작업에 집중할 때 정리를 잠시 미루세요. ‘계속 진행’을 선택하면 대기한 작업을 이어갑니다.</span></li><li>정리할 폴더<span>폴더 목록을 바꾸고 미리보기로 변경할 이름을 확인하세요.</span></li><li>설정<span>로그인할 때 실행하도록 설정하고 언어, 글꼴 테마와 아이콘 애니메이션을 골라 보세요.</span></li><li>창 닫기·앱 종료<span>창을 닫으면 백그라운드에서 계속 정리합니다. 작업까지 마치려면 ‘Jaso NFC 종료’를 선택하세요. 다시 사용할 때는 앱을 열고 ‘작업 시작’을 누르세요.</span></li></ul>
+  </section>
+  <section id="questions" class="section faq" aria-labelledby="faq-title">
+    <div><p class="eyebrow">알아두면 좋은 점</p><h2 id="faq-title">궁금한 점.</h2><p class="body-copy">폴더 선택부터 문제 해결까지,<br>필요한 방법을 찾아보세요.</p></div>
+    <div class="questions">
+      <details id="blocked"><summary>macOS에서 앱 실행을 허용하려면?</summary><p>다운로드한 파일의 출처를 확인한 뒤 <a href="https://support.apple.com/ko-kr/102445">Apple의 앱 실행 허용 안내</a>를 따라 주세요. 앱을 한 번 열어 본 다음 시스템 설정 → 개인정보 보호 및 보안에서 ‘확인 없이 열기’를 선택합니다. 해당 항목이 없거나 손상 메시지가 나오면 다시 다운로드하거나 지원팀에 문의해 주세요.</p></details>
+      <details><summary>다른 폴더도 정리하려면?</summary><p>‘정리할 폴더…’에서 원하는 폴더를 추가하고 미리보기 후 설정을 저장하세요. 이미 설정한 폴더를 다시 확인하려면 상태 창의 ‘전체 감시 영역 다시 확인’을 누르세요. 자세한 순서는 <a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.md#change-folders">폴더 설정 안내</a>에 있습니다.</p></details>
+      <details><summary>클라우드 폴더에 재시도가 표시되면?</summary><p>상태 창에서 해당 경로와 원인을 확인하고 Finder에서 폴더를 열어 보세요. OneDrive, Google Drive 등 동기화 앱의 로그인과 연결 상태도 확인해 주세요. 연결을 복구한 뒤에는 Jaso NFC가 예약된 시각부터 다시 시도합니다.</p></details>
+      <details><summary>어떤 이름을 정리하나요?</summary><p>설정한 폴더 안에서 분해된 한글 등 NFC 정규화가 필요한 파일명과 폴더 이름을 정리합니다. 직접 입력한 <code>ㅎㅏㄴ</code> 같은 호환 자모는 처리 대상에서 제외됩니다. 앱·사진 보관함 등 자동 제외되는 종류와 직접 제외할 폴더는 <a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.md#변경-범위와-안전성">처리 범위 안내</a>에서 확인하세요.</p></details>
+      <details><summary>이름을 되돌리거나 앱을 제거하려면?</summary><p>먼저 작업을 중지하고 <a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.md#recovery">되돌리기와 제거 안내</a>를 따라 주세요. 변경 기록에 있는 원본 파일을 확인할 수 있으면 이전 이름으로 되돌릴 수 있습니다. 파일을 이동하거나 교체한 경우 복구가 제한될 수 있습니다. exFAT에서는 다른 앱과 동시에 이름을 바꿀 때 덮어쓰기 위험이 있어, 사용 설명서의 처리 한계도 확인해 주세요.</p></details>
+      <details><summary>처리 기록은 어디에서 볼 수 있나요?</summary><p>상태 창의 ‘복구 기록 폴더 열기’로 Mac에 저장된 이름 변경 기록을 확인할 수 있습니다. 문제가 생겼을 때는 ‘진단 정보 복사’로 상태를 전달해 주세요. 공유하기 전에 개인 파일명과 경로를 지워 주세요.</p></details>
+    </div>
+  </section>
+  <section class="bottom-cta" aria-label="다운로드와 지원"><div><h2>다운로드 폴더의 한글 이름부터 정리해 보세요.</h2><p>설치 후 정리할 폴더를 선택해 주세요.</p></div><a class="button" href="https://github.com/garlicvread/jaso-nfc/releases/download/v0.1.0/Jaso-NFC-0.1.0-arm64-local.dmg">다운로드 <span aria-hidden="true">↓</span></a></section>
+</main>
+<footer><div class="wrap footer-inner"><span>Jaso NFC · AidALL Inc.</span><div class="footer-links"><a href="mailto:aidall_manager@aidall.tech">문의</a><a href="https://github.com/garlicvread/jaso-nfc/releases/tag/v0.1.0">릴리스 정보</a><a href="https://github.com/garlicvread/jaso-nfc/blob/main/LICENSE">MIT 라이선스</a><a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/development.md">개발 문서 ↗</a></div></div></footer>
+</body>
+</html>

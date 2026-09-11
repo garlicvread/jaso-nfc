@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Tidy decomposed Korean filenames and automatically handle new files in your chosen folders. Install Jaso NFC and start with Downloads.">
+  <meta name="theme-color" content="#f8f8f1">
+  <meta property="og:title" content="Jaso NFC — Bring Korean filenames together">
+  <meta property="og:description" content="A Mac app that tidies Korean filenames and keeps watching for new files. Follow the setup guide to start automatic cleanup in Downloads.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://garlicvread.github.io/jaso-nfc/en/">
+  <link rel="canonical" href="https://garlicvread.github.io/jaso-nfc/en/">
+  <link rel="alternate" hreflang="ko" href="https://garlicvread.github.io/jaso-nfc/">
+  <link rel="icon" href="../assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../assets/styles.css">
+  <script src="../assets/guide.js" defer></script>
+  <title>Jaso NFC — Bring Korean filenames together</title>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="header">
+  <nav class="nav wrap" aria-label="Main navigation">
+    <a class="brand" href="./" aria-label="Jaso NFC home"><img src="../assets/mark.svg" alt="" width="36" height="36">Jaso NFC</a>
+    <div class="nav-links"><a href="#setup">Get started</a><a class="desktop-link" href="#questions">Questions</a><a class="desktop-link" href="https://github.com/garlicvread/jaso-nfc">GitHub ↗</a><a class="language" href="../" lang="ko" hreflang="ko">한국어</a></div>
+  </nav>
+</header>
+<main id="main" class="wrap">
+  <section class="hero" aria-labelledby="hero-title">
+    <div>
+      <p class="eyebrow">Automatic Korean filename cleanup <span>v0.1.0</span></p>
+      <h1 id="hero-title">Bring Korean<br><em>filenames together.</em></h1>
+      <p class="hero-copy">Tidy Korean filenames that became separated when sharing files. Jaso NFC watches your chosen folders and automatically cleans up the names of new files and folders.</p>
+      <div class="actions"><a class="button" href="https://github.com/garlicvread/jaso-nfc/releases/download/v0.1.0/Jaso-NFC-0.1.0-arm64-local.dmg">Download <span aria-hidden="true">↓</span></a><a class="button secondary" href="#setup">Install guide</a></div>
+      <p class="compatibility">Apple Silicon Mac · macOS 13 or later · Free / MIT licensed</p>
+      <p class="before-download">Start with Downloads. <a href="#setup">Choose your folders in the app and begin cleanup.</a></p>
+    </div>
+    <div class="art" role="img" aria-label="An illustration showing separate Korean consonants and vowels combining into the filename 보고서.pdf.">
+      <div class="art-top"><span>From separate letters to Korean syllables</span><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span></div>
+      <div class="file"><div class="file-label"><span>Before · separate consonants and vowels</span><svg viewBox="0 0 22 26" fill="none" aria-hidden="true"><path d="M4 1h9l7 7v17H2V1h2zM13 1v8h7" stroke="currentColor" stroke-width="1.3"/></svg></div><div class="jamo" aria-hidden="true"><span>ᄇ</span><span>ᅩ</span><span>ᄀ</span><span>ᅩ</span><span>ᄉ</span><span>ᅥ</span><small>.pdf</small></div></div>
+      <div class="flow">Tidy the Korean filename <span aria-hidden="true">↓</span></div>
+      <div class="file after"><div class="file-label"><span>After · a composed Korean name</span><span>JASO NFC</span></div><div class="filename"><span>보고서<small>.pdf</small></span><span class="check" aria-hidden="true">✓</span></div></div>
+      <p class="art-caption">An illustration of how Korean filename characters come together.</p>
+    </div>
+  </section>
+  <div class="quick-facts" aria-label="How the app works">
+    <div class="fact"><span class="number">01</span><p>Tidy Korean filenames<small>Bring separate letters into syllables</small></p></div>
+    <div class="fact"><span class="number">02</span><p>Keep folders organized<small>Automatically check new files</small></p></div>
+    <div class="fact"><span class="number">03</span><p>See what needs attention<small>File status with clear next steps</small></p></div>
+  </div>
+  <section id="setup" class="section" aria-labelledby="setup-title">
+    <div class="section-heading"><div><p class="eyebrow">Getting started</p><h2 id="setup-title">Start cleaning up Downloads.</h2></div><p class="section-intro">Install the app, review the names to change,<br>and start automatic cleanup in Downloads.</p></div>
+    <div class="steps">
+      <article><span class="step-num">STEP 01</span><h3>Open the installer</h3><p>Open the downloaded <code>.dmg</code>, double-click <code>Install Jaso NFC.app</code>, and choose Install.</p><p class="small">When it finishes, keep the installer file or move it to Trash. Close the installer window and eject the mounted disk in Finder.</p></article>
+      <article><span class="step-num">STEP 02</span><h3>Review the files to rename</h3><p>Choose Jaso NFC in the menu bar → Manage folders…. Pick your folders and choose Preview filenames to compare current and proposed names side by side.</p><p class="small">Start with Downloads, then add other folders you need or remove them from the list.</p></article>
+      <article><span class="step-num">STEP 03</span><h3>Start automatic cleanup</h3><p>After reviewing the preview, choose Start automatic cleanup. Jaso NFC cleans up your chosen folders and keeps checking new files.</p><p class="small">Use Open Status… to see current activity and items that need attention.</p></article>
+    </div>
+    <div id="enable" class="setup-box">
+      <div class="setup-intro"><p class="eyebrow">Folder settings</p><h3>Choose where cleanup happens.</h3><p>Open Manage folders… to review your list, add folders, or remove them. Existing users can continue with their saved folders and exclusions.</p><p><a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.en.md#change-folders">More about folder selection and exclusions ↗</a></p></div>
+      <div class="setup-code"><h3>See the names before you start.</h3><p>The preview shows current and proposed names side by side. If a folder is unavailable, follow the guidance to check its access permissions or connection.</p><p>When ready, choose Start automatic cleanup. Use the menu bar to put cleanup on hold or continue it later.</p></div>
+    </div>
+    <div class="permission"><p>To grant access to a protected folder, add and enable Jaso NFC from Applications in System Settings → Privacy &amp; Security → Full Disk Access. Then choose Restart worker in the status window.</p><a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.en.md#permissions">Set up folder access ↗</a></div>
+  </section>
+  <section id="everyday" class="section everyday" aria-labelledby="everyday-title">
+    <div><p class="eyebrow">Made for everyday use</p><h2 id="everyday-title">Your everyday controls,<br>in the menu bar.</h2><p class="body-copy">Jaso NFC keeps watching your chosen folders. Check how cleanup is going, pause for another task, and resume when you are ready.</p></div>
+    <ul class="menu-list"><li>Open Status<span>See current activity and waiting items. Each problem includes the file path and steps to check it.</span></li><li>Pause / Resume<span>Put cleanup on hold while you focus on another task. Choose Resume to process the waiting work.</span></li><li>Manage folders<span>Update your folder list and preview the names to change.</span></li><li>Settings<span>Set the app to run at login, then choose your language, font style, and icon animation.</span></li><li>Close / Quit<span>Close the window to leave cleanup running in the background. Choose Quit Jaso NFC to stop it too. Next time, open the app and choose Start worker.</span></li></ul>
+  </section>
+  <section id="questions" class="section faq" aria-labelledby="faq-title">
+    <div><p class="eyebrow">A few things to know</p><h2 id="faq-title">Your questions.</h2><p class="body-copy">Find the steps you need,<br>from choosing folders to solving problems.</p></div>
+    <div class="questions">
+      <details id="blocked"><summary>How do I allow the app to open?</summary><p>After checking that you trust the download, follow <a href="https://support.apple.com/en-us/102445">Apple’s app opening instructions</a>. Try opening the app, then choose Open Anyway in System Settings → Privacy &amp; Security. If that option is unavailable or you see a damage message, download it again or contact support.</p></details>
+      <details><summary>How do I clean up another folder?</summary><p>Open Manage folders… to add a folder, preview the names, and save your settings. To recheck a folder already in your selection, open Status and choose Recheck all watched roots. Follow the <a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.en.md#change-folders">folder setup guide</a> for the steps.</p></details>
+      <details><summary>What should I do when a cloud folder is waiting to retry?</summary><p>Check the path and reason in Status, then try opening the folder in Finder. Also check the login and connection in OneDrive, Google Drive, or your sync app. Once access is restored, Jaso NFC can try again from the scheduled retry time.</p></details>
+      <details><summary>Which names does the app clean up?</summary><p>Jaso NFC processes file and folder names that need NFC normalization, including decomposed Korean, within your chosen folders. Separately typed compatibility letters such as <code>ㅎㅏㄴ</code> are outside this conversion. See <a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.en.md#scope-and-safety">the processing scope guide</a> for automatic exclusions, such as selected app and photo-library formats, and folders you can exclude yourself.</p></details>
+      <details><summary>How do I undo name changes or remove the app?</summary><p>Stop the worker, then follow the <a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.en.md#recovery">recovery and removal steps</a>. Retained history can restore earlier names when the original files can still be identified. Later moves or replacements may limit recovery. On exFAT, simultaneous renaming by another app can create an overwrite risk; see the processing limits in the guide before using it there.</p></details>
+      <details><summary>Where can I find the processing history?</summary><p>Choose Open recovery history in Status to see the name-change records stored on your Mac. To ask for help with a problem, use Copy diagnostics to share its status. Remove private filenames and paths before sharing.</p></details>
+    </div>
+  </section>
+  <section class="bottom-cta" aria-label="Download and support"><div><h2>Start with the Korean filenames in Downloads.</h2><p>Install the app and choose your folders to get started.</p></div><a class="button" href="https://github.com/garlicvread/jaso-nfc/releases/download/v0.1.0/Jaso-NFC-0.1.0-arm64-local.dmg">Download <span aria-hidden="true">↓</span></a></section>
+</main>
+<footer><div class="wrap footer-inner"><span>Jaso NFC · AidALL Inc.</span><div class="footer-links"><a href="mailto:aidall_manager@aidall.tech">Contact</a><a href="https://github.com/garlicvread/jaso-nfc/releases/tag/v0.1.0">Release notes</a><a href="https://github.com/garlicvread/jaso-nfc/blob/main/LICENSE">MIT license</a><a href="https://github.com/garlicvread/jaso-nfc/blob/main/docs/development.md">Developer docs ↗</a></div></div></footer>
+</body>
+</html>

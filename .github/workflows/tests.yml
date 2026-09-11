@@ -1,0 +1,53 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  native:
+    name: Native macOS app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Check Rust diagnostics
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test native modules and integration
+        run: cargo test --locked
+      - name: Build the CLI used by black-box tests
+        run: cargo build --locked
+      - name: Test the native CLI on owned temporary fixtures
+        run: python3 native/tests/test_cli.py
+      - name: Test folder setup, preview, and transactional saves
+        run: python3 native/tests/test_setup.py
+      - name: Test app entry and CLI isolation on owned bundles
+        run: python3 native/tests/test_app_trampoline.py
+      - name: Test single-registration worker and detached menu lifecycle
+        run: python3 native/tests/test_installed_runtime.py
+      - name: Test menu startup and icons, then verify the app bundle
+        run: sh scripts/build-native.sh
+      - name: Build and verify the graphical installation disk image
+        run: sh scripts/build-installer.sh --app 'dist/Jaso NFC.app'
+  python-compatibility:
+    name: Python compatibility (${{ matrix.python }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test retained Python behavior and formats
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v

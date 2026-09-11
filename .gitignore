@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.tmp/
+dist/
+build/
+*.egg-info/
+.DS_Store
+*.sqlite3*
+*.jsonl*
+skip.json
+pending.json
+.coverage
+/target/

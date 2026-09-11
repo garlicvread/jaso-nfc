@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>io.github.garlicvread.jaso-nfc</string>
+<key>CFBundleName</key><string>Jaso NFC</string>
+<key>CFBundleExecutable</key><string>jaso-nfc</string>
+<key>CFBundleIconFile</key><string>JasoNFC.icns</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>100</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSUIElement</key><false/>
+<key>NSHighResolutionCapable</key><true/>
+<key>NSHumanReadableCopyright</key><string>Copyright 2026 jaso-nfc contributors. Distributed by AidALL Inc. · MIT License</string>
+<key>JasoPublisher</key><string>AidALL Inc.</string>
+<key>JasoSupportEmail</key><string>aidall_manager@aidall.tech</string>
+<key>JasoSourceURL</key><string>https://github.com/garlicvread/jaso-nfc</string>
+</dict></plist>

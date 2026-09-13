@@ -50,7 +50,7 @@ pub fn open_at(parent: RawFd, name: &str, flags: i32) -> io::Result<File> {
     let _materialization = if flags & libc::O_DIRECTORY != 0 {
         Some(DirectoryMaterialization::begin()?)
     } else {
-        None
+        Some(DirectoryMaterialization::deny()?)
     };
     #[cfg(all(test, target_os = "macos"))]
     TEST_OPEN_MATERIALIZATION_POLICY.set(unsafe {
@@ -226,6 +226,7 @@ pub fn candidate_stored_name(
         .map(|_| actual))
 }
 pub fn marker_get(fd: RawFd, key: &str) -> io::Result<Option<Vec<u8>>> {
+    let _materialization = DirectoryMaterialization::deny()?;
     let key = cstring(key)?;
     #[cfg(target_os = "macos")]
     let size = unsafe { libc::fgetxattr(fd, key.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
@@ -264,6 +265,7 @@ pub fn marker_get(fd: RawFd, key: &str) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(buffer))
 }
 pub fn marker_create(fd: RawFd, key: &str, token: &[u8]) -> io::Result<libc::stat> {
+    let _materialization = DirectoryMaterialization::deny()?;
     if token.is_empty() || token.len() > 4096 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -298,6 +300,7 @@ pub fn marker_create(fd: RawFd, key: &str, token: &[u8]) -> io::Result<libc::sta
     fstat(fd)
 }
 pub fn marker_remove(fd: RawFd, key: &str, token: &[u8]) -> io::Result<libc::stat> {
+    let _materialization = DirectoryMaterialization::deny()?;
     if let Some(current) = marker_get(fd, key)? {
         if current != token {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
@@ -456,6 +459,20 @@ mod tests {
                 );
                 assert_eq!(policy(THREAD), OFF);
                 assert_eq!(policy(PROCESS), process);
+            });
+        }
+
+        #[test]
+        fn nested_regular_file_open_denies_materialization_and_restores_directory_policy() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("file");
+            std::fs::write(&path, b"fixture").unwrap();
+            with_materialization_off(|| {
+                let _outer = DirectoryMaterialization::begin().unwrap();
+                let file = open_at(libc::AT_FDCWD, path.to_str().unwrap(), libc::O_RDONLY).unwrap();
+                assert!(file.metadata().unwrap().is_file());
+                assert_eq!(TEST_OPEN_MATERIALIZATION_POLICY.get(), OFF);
+                assert_eq!(policy(THREAD), ON);
             });
         }
 

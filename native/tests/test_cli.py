@@ -3,7 +3,9 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -42,6 +44,23 @@ class NativeCLI(unittest.TestCase):
                                 env={**os.environ, "HOME": str(config.parent)})
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return json.loads(result.stdout)
+
+    def wait_for_worker_ready(self, worker, state, timeout=20):
+        # The worker publishes this record after index initialization. Merely
+        # seeing its PID or database file does not make status reads ready.
+        deadline = time.monotonic() + timeout
+        ready = {}
+        while time.monotonic() < deadline:
+            if worker.poll() is not None:
+                self.fail("worker exited before readiness: " + worker.stderr.read())
+            try:
+                ready = json.loads((state / "state/runtime.json").read_text())
+            except FileNotFoundError:
+                ready = {}
+            if ready.get("pid") == worker.pid:
+                return
+            time.sleep(.01)
+        self.fail(f"worker {worker.pid} did not publish runtime readiness: {ready}")
 
     def fixture(self, base):
         # The .app boundary prevents an unrelated installed broad watcher from
@@ -105,6 +124,43 @@ class NativeCLI(unittest.TestCase):
                     self.assertEqual(stored_name(root / original), original)
                 self.assertEqual((root / directory / child).read_bytes(), b"nested")
 
+    def test_watch_package_boundaries_drain_without_parent_rescan_loop(self):
+        root, config, state = self.fixture(None)
+        packages = [root / "Editor.app", root / "Runtime.framework"]
+        for package in packages:
+            package.mkdir()
+            (package / "internal.txt").write_bytes(b"package contents")
+        (root / "documents").mkdir()
+        document = root / "documents" / unicodedata.normalize("NFD", "일반.txt")
+        document.write_bytes(b"ordinary document")
+        worker = subprocess.Popen([str(BINARY), "watch", "--config", str(config)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            self.wait_for_worker_ready(worker, state)
+            deadline = time.monotonic() + 20
+            status = {}
+            while time.monotonic() < deadline:
+                self.assertIsNone(worker.poll(), "worker exited before the queue drained")
+                status = self.call("status", config=config)
+                if status.get("baseline_complete") and status.get("pending_jobs") == 0:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("package-containing root never reached idle: " + json.dumps(status))
+            self.assertEqual(stored_name(document), "일반.txt")
+            self.assertEqual(document.read_bytes(), b"ordinary document")
+            with sqlite3.connect(f"file:{state / 'state/index.sqlite3'}?mode=ro", uri=True) as database:
+                paths = {row[0] for row in database.execute("SELECT path FROM entries")}
+            for package in packages:
+                self.assertIn(str(package), paths, "a skipped package must retain its saved entry")
+                self.assertNotIn(str(package / "internal.txt"), paths)
+                self.assertEqual((package / "internal.txt").read_bytes(), b"package contents")
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            _, error = worker.communicate(timeout=10)
+            self.assertEqual(worker.returncode, 0, error)
+
     def test_watch_pause_restart_and_incremental_replay(self):
         roots = []
         for base in [None, *filter(None, os.environ.get("JASO_TEST_VOLUMES", "").split(":"))]:
@@ -134,6 +190,7 @@ class NativeCLI(unittest.TestCase):
             self.assertEqual(worker.returncode, 0, error)
         try:
             worker = start()
+            self.wait_for_worker_ready(worker, state)
             until(lambda: status().get("baseline_complete"), "initial index")
             initial = status()
             self.assertEqual(len(initial["active_roots"]), len(roots))
@@ -155,6 +212,7 @@ class NativeCLI(unittest.TestCase):
             stop()
             offline_paths = create("꺼진동안")
             worker = start()
+            self.wait_for_worker_ready(worker, state)
             until(lambda: status().get("running") and status().get("active_roots"), "restart")
             self.assertTrue(status()["paused"])
             self.assertTrue(all(stored_name(p) == p.name for p in paused_paths + offline_paths))
@@ -171,6 +229,64 @@ class NativeCLI(unittest.TestCase):
             if worker is not None and worker.poll() is None:
                 worker.terminate()
                 worker.communicate(timeout=10)
+
+
+class WorkerReadiness(unittest.TestCase):
+    """Keep the startup barrier strict without depending on scheduler timing."""
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="jaso-readiness-", suffix=".app")
+        self.addCleanup(directory.cleanup)
+        self.state = Path(directory.name)
+        self.marker = self.state / "state/runtime.json"
+        self.marker.parent.mkdir()
+
+    def start_fixture(self, code):
+        worker = subprocess.Popen([sys.executable, "-c", code, str(self.marker)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        def stop():
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=5)
+        self.addCleanup(stop)
+        return worker
+
+    def test_waits_for_delayed_acknowledgement_from_current_pid(self):
+        self.marker.write_text(json.dumps({"pid": -1}))
+        worker = self.start_fixture(
+            "import json,os,sys,time; from pathlib import Path; "
+            "time.sleep(.05); path=Path(sys.argv[1]); temp=path.with_suffix('.tmp'); "
+            "temp.write_text(json.dumps({'pid':os.getpid()})); os.replace(temp,path); time.sleep(10)")
+        NativeCLI.wait_for_worker_ready(self, worker, self.state)
+        self.assertEqual(json.loads(self.marker.read_text())["pid"], worker.pid)
+        self.assertIsNone(worker.poll())
+
+    def test_worker_exit_is_reported_before_readiness(self):
+        worker = self.start_fixture("import sys; sys.stderr.write('fixture worker crash'); sys.exit(7)")
+        with self.assertRaisesRegex(AssertionError, "worker exited before readiness: fixture worker crash"):
+            NativeCLI.wait_for_worker_ready(self, worker, self.state)
+
+    def test_stale_pid_does_not_satisfy_bounded_startup_wait(self):
+        self.marker.write_text(json.dumps({"pid": -1}))
+        worker = self.start_fixture("import time; time.sleep(10)")
+        with self.assertRaisesRegex(AssertionError, "did not publish runtime readiness"):
+            NativeCLI.wait_for_worker_ready(self, worker, self.state, timeout=.05)
+        self.assertIsNone(worker.poll())
+
+    def test_malformed_acknowledgement_is_not_retried(self):
+        self.marker.write_text("not JSON")
+        worker = self.start_fixture("import time; time.sleep(10)")
+        with self.assertRaises(json.JSONDecodeError):
+            NativeCLI.wait_for_worker_ready(self, worker, self.state)
+
+    def test_status_still_rejects_database_corruption(self):
+        fixture = NativeCLI()
+        self.addCleanup(fixture.doCleanups)
+        _, config, state = fixture.fixture(None)
+        database = state / "state/index.sqlite3"
+        database.parent.mkdir()
+        database.write_bytes(b"not a SQLite database")
+        with self.assertRaisesRegex(AssertionError, "not a database"):
+            fixture.call("status", config=config)
 
 if __name__ == "__main__":
     unittest.main()

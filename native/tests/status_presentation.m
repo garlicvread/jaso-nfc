@@ -9,6 +9,8 @@
 extern NSDictionary *JasoStatusPresentation(NSDictionary *, NSString *, BOOL) __attribute__((weak_import));
 #endif
 
+extern NSDictionary *JasoActivityPresentation(NSDictionary *, BOOL) __attribute__((weak_import));
+
 static NSUInteger checks;
 static void Require(BOOL condition, NSString *message) {
     checks++;
@@ -71,12 +73,96 @@ static void CheckShape(NSDictionary *result) {
     Require(!Contains(result, @"%") && ![VisibleText(result) containsString:@"ETA"], @"No invented progress denominator or ETA");
 }
 
+static void TestActivityPresentation(void) {
+    Require(JasoActivityPresentation != NULL, @"The pure historical activity presentation is linked");
+    NSString *path=@"/Users/example/Library/CloudStorage/Account/file.txt";
+    for(NSNumber *locale in @[@NO,@YES]) {
+        BOOL ko=locale.boolValue;
+        NSDictionary *base=@{@"kind":@"deferred",@"phase":@"metadata",@"path":path,@"sequence":@3,@"at":@1000,
+            @"reason":@"dataless file deferred; download state is not verified",@"occurrences":@245,@"first_at":@900};
+        NSMutableDictionary *event=[base mutableCopy];
+        NSDictionary *cloud=JasoActivityPresentation(event,ko);
+        Require([cloud[@"title"] isEqual:ko?@"클라우드에 보관 중":@"Stored in the cloud"],@"Saved dataless cause supplies the actual Activity title");
+        Require([cloud[@"category"] isEqual:@"cloud-only"]&&![cloud[@"resolved"] boolValue],@"Cloud observations are not already resolved or a user error");
+        Require(!Contains(cloud[@"detail"],ko?@"실패":@"failed")&&!Contains(cloud[@"detail"],@"245"),@"Repeated dataless observations must not imply hundreds of user failures");
+        Require([cloud[@"pathActionAllowed"] boolValue],@"Complete absolute activity paths remain inspectable");
+        event[@"kind"]=@"error";event[@"errno"]=@(EACCES);
+        NSDictionary *permission=JasoActivityPresentation(event,ko);
+        Require([permission[@"category"] isEqual:@"permission"]&&Contains(permission[@"title"],ko?@"접근 권한":@"Access was denied"),@"A saved numeric errno takes precedence over conflicting saved text");
+        Require(!Contains(permission[@"detail"],ko?@"전체 디스크":@"Full Disk")&&!Contains(permission[@"title"],ko?@"필요":@"Check"),@"Historical permission evidence is not a diagnosis of which current setting to change");
+        event[@"reason"]=@"Operation timed out (os error 60)";[event removeObjectForKey:@"errno"];
+        NSDictionary *timeout=JasoActivityPresentation(event,ko);
+        Require([timeout[@"category"] isEqual:@"timeout"]&&Contains(timeout[@"title"],ko?@"응답 시간 초과":@"Response timed out"),@"Saved metadata timeout is named without inventing a network cause");
+        Require(!Contains(timeout[@"detail"],ko?@"확인하세요":@"check the drive"),@"A historical event is not current repair advice");
+        for(id malformed in @[NSNull.null,@YES,@60.5,@"13",@2147483648LL,@[]]) {
+            event[@"errno"]=malformed;
+            Require([JasoActivityPresentation(event,ko)[@"category"] isEqual:@"timeout"],@"Invalid errno values fall back to the recorded reason");
+        }
+        event[@"errno"]=@999;event[@"reason"]=@"Permission denied (os error 13)";
+        Require(![JasoActivityPresentation(event,ko)[@"category"] isEqual:@"permission"],@"An unknown valid numeric errno must not be overwritten by conflicting text");
+        NSDictionary *unknownErrno=JasoActivityPresentation(event,ko);
+        Require(Contains(unknownErrno[@"detail"],@"Permission denied (os error 13)")&&Contains(unknownErrno[@"detail"],@"999"),@"An unknown typed errno preserves the separately recorded raw message without using it to override classification");
+        for(NSDictionary *failure in @[@{@"errno":@(ENOSPC),@"reason":@"No space left on device (os error 28)"},
+            @{@"errno":NSNull.null,@"reason":@"Critical storage: fewer than 256 MiB available for /fixture. Free up space before starting new filename changes; pending recovery remains available."}]) {
+            NSMutableDictionary *storage=[event mutableCopy];[storage addEntriesFromDictionary:failure];
+            NSDictionary *display=JasoActivityPresentation(storage,ko);
+            Require([display[@"category"] isEqual:@"storage"]&&[display[@"title"] isEqual:ko?@"디스크 여유 공간 부족":@"Insufficient disk space"],@"Both the actual preflight low-space message and ENOSPC have a storage-specific historical cause");
+            Require(!Contains(display[@"detail"],ko?@"확인하세요":@"Free up"),@"Recorded storage failures describe the observation without issuing current repair instructions");
+        }
+        [event removeObjectForKey:@"errno"];event[@"reason"]=@"/folder/Permission denied (os error 13)";
+        Require(![JasoActivityPresentation(event,ko)[@"category"] isEqual:@"permission"],@"An error-like path string must not classify a historical failure");
+        event[@"path"]=@"/folder/Permission denied (os error 13)";event[@"reason"]=NSNull.null;
+        Require(![JasoActivityPresentation(event,ko)[@"category"] isEqual:@"permission"],@"The event path cannot supply an errno");
+        for(id legacyReason in @[NSNull.null,@13,@YES,@[],@{}]) {
+            event[@"reason"]=legacyReason;
+            NSDictionary *legacy=JasoActivityPresentation(event,ko);
+            Require(Contains(legacy[@"detail"],ko?@"원인이 기록되지 않았습니다":@"cause was not recorded"),@"Legacy malformed causes are explicitly unknown rather than silently diagnosed");
+            Require(![legacy[@"resolved"] boolValue],@"Missing state never proves a historical issue was resolved");
+        }
+        event=[base mutableCopy];event[@"kind"]=@"error";event[@"errno"]=@(EACCES);event[@"reason"]=@"Permission denied (os error 13)";
+        event[@"resolved_at"]=@2000;event[@"resolution"]=@"checked";
+        NSDictionary *resolved=JasoActivityPresentation(event,ko);
+        Require([resolved[@"resolved"] boolValue]&&Contains(resolved[@"title"],ko?@"이후 검사 완료":@"Checked successfully later"),@"The later confirmed outcome replaces the error headline");
+        Require([resolved[@"category"] isEqual:@"permission"]&&Contains(resolved[@"detail"],ko?@"접근 권한":@"Access was denied"),@"Resolution preserves the original cause in detail");
+        Require(Contains(resolved[@"detail"],ko?@"해결 시각":@"Resolved at"),@"The actual resolution timestamp is visible");
+        Require(!Contains(resolved[@"detail"],ko?@"확인하세요":@"retry automatically")&&!Contains(resolved[@"detail"],ko?@"필요합니다":@"Check permissions"),@"Resolved history must not demand repair of the old failure");
+        for(NSString *outcome in @[@"renamed",@"restored",@"absent",@"no_longer_needed"]) {
+            event[@"resolution"]=outcome;
+            NSDictionary *finished=JasoActivityPresentation(event,ko);
+            Require([finished[@"resolved"] boolValue]&&![finished[@"title"] isEqual:resolved[@"title"]],@"Distinct confirmed resolution outcomes have meaningful titles");
+            Require(Contains(finished[@"detail"],ko?@"접근 권한":@"Access was denied"),@"Every resolution outcome retains the cause");
+        }
+        event[@"resolution"]=@"future_outcome";
+        Require(![JasoActivityPresentation(event,ko)[@"resolved"] boolValue],@"An unknown resolution cannot claim success");
+        event[@"resolution"]=@"checked";
+        for(id badTime in @[NSNull.null,@YES,@"2000",@(-1),@500,@[]]) {
+            event[@"resolved_at"]=badTime;
+            Require(![JasoActivityPresentation(event,ko)[@"resolved"] boolValue],@"Resolution requires a valid time after the recorded observation");
+        }
+        event=[base mutableCopy];event[@"path_truncated"]=@YES;
+        Require(![JasoActivityPresentation(event,ko)[@"pathActionAllowed"] boolValue],@"Explicitly truncated paths cannot identify Finder action targets");
+        [event removeObjectForKey:@"path_truncated"];event[@"path"]=@"/folder/old truncated…";
+        Require(![JasoActivityPresentation(event,ko)[@"pathActionAllowed"] boolValue],@"Legacy ellipsis paths must fail closed for matching and Finder actions");
+        for(id malformedPath in @[NSNull.null,@13,@"relative/file",@"/folder/../file",@"/folder/./file",[NSString stringWithFormat:@"/folder/%Cfile",(unichar)0]]) {
+            event[@"path"]=malformedPath;
+            Require(![JasoActivityPresentation(event,ko)[@"pathActionAllowed"] boolValue],@"Noncanonical or malformed paths must not become action targets");
+        }
+        for(id malformed in @[NSNull.null,@[],@{},@42]) {
+            NSDictionary *unknown=JasoActivityPresentation(malformed,ko);
+            Require([unknown[@"title"] isKindOfClass:NSString.class]&&[unknown[@"detail"] isKindOfClass:NSString.class],@"Malformed event payloads produce safe visible text");
+        }
+    }
+}
+
 int main(void) {
     @autoreleasepool {
         @try {
 #ifdef JASO_MISSING_PRESENTATION
             Require(JasoStatusPresentation != NULL, @"The human-readable presentation model is linked");
 #endif
+            TestActivityPresentation();
+            NSDictionary *storageRetry=Present(@{@"directory_retry_items":@[@{@"path":@"/fixture/folder",@"reason":@"No space left on device (os error 28)"}]});
+            Require([storageRetry[@"issues"][0][@"category"] isEqual:@"storage"]&&[storageRetry[@"issues"][0][@"requiresAction"] boolValue],@"A current recorded ENOSPC uses the shared storage classification and current action guidance");
             NSDictionary *good = Present(@{});
             CheckShape(good);
             Require([good[@"tone"] isEqual:@"good"], @"Confirmed active idle worker is healthy");
@@ -85,6 +171,28 @@ int main(void) {
             Require([good[@"metrics"][0][@"value"] isEqual:@"12,345"], @"Indexed entries formatted as count");
             Require(Contains(good[@"metrics"][0][@"note"], @"files") && Contains(good[@"metrics"][0][@"note"], @"folders"), @"Indexed entries include files and folders");
             Require([good[@"locations"][0][@"path"] isEqual:@"/Users/example/Documents"], @"Location retains full path");
+
+            NSDictionary *current = @{@"pending_jobs":@0, @"deferred_jobs":@0, @"deferred_renames":@0,
+                @"next_retry":NSNull.null, @"directory_retry_count":@0, @"directory_retry_items":@[], @"rename_retry_items":@[],
+                @"baseline_complete":@YES, @"pending_baseline_roots":@[], @"needs_revalidation":@NO};
+            NSDictionary *disconnectedSnapshot = Snapshot(@{@"roots":@[@"/Users/example/Documents", @"/Volumes/Archive"],
+                @"disconnected_roots":@[@"/Volumes/Archive"], @"baseline_complete":@NO,
+                @"pending_baseline_roots":@[@"/Volumes/Archive"], @"pending_jobs":@32, @"deferred_renames":@2,
+                @"next_retry":@1000, @"current":current});
+            for (NSNumber *korean in @[@NO, @YES]) {
+                NSDictionary *disconnected = JasoStatusPresentation(disconnectedSnapshot, nil, korean.boolValue);
+                Require([disconnected[@"tone"] isEqual:@"good"], @"A disconnected drive's saved work does not override current watching status");
+                Require(!Location(disconnected, @"/Volumes/Archive") && [disconnected[@"locations"] count] == 1, @"Disconnected drives belong in management, not the current locations list");
+                Require([disconnected[@"metrics"][1][@"value"] isEqual:@"0"] && [disconnected[@"metrics"][2][@"value"] isEqual:@"0"], @"Current queue and retry counts exclude dormant drive work");
+                NSMutableDictionary *onlyDrives = [disconnectedSnapshot mutableCopy]; onlyDrives[@"active_roots"] = @[]; onlyDrives[@"roots"] = @[@"/Volumes/Archive"];
+                NSDictionary *idle = JasoStatusPresentation(onlyDrives, nil, korean.boolValue);
+                Require([idle[@"tone"] isEqual:@"neutral"] && Contains(idle[@"title"], korean.boolValue ? @"연결된 드라이브 없음" : @"No drives connected"), @"An unplugged selected drive is a neutral connection state");
+                onlyDrives[@"pending_recovery"] = @YES;
+                Require([JasoStatusPresentation(onlyDrives, nil, korean.boolValue)[@"tone"] isEqual:@"warning"], @"Pending recovery remains visible while a drive is disconnected");
+            }
+            NSMutableDictionary *connectedFailure = [disconnectedSnapshot mutableCopy];
+            connectedFailure[@"unavailable_roots"] = @{@"/Users/example/Library/CloudStorage/Account":@"Permission denied (os error 13)"};
+            Require([JasoStatusPresentation(connectedFailure, nil, NO)[@"tone"] isEqual:@"warning"], @"Current cloud access errors still need attention alongside disconnected drives");
 
             NSDictionary *indexing = Present(@{@"baseline_complete":@NO, @"pending_jobs":@0});
             Require([indexing[@"tone"] isEqual:@"working"] && Contains(indexing[@"title"], @"index"), @"Zero queue does not complete initial indexing");
@@ -113,11 +221,37 @@ int main(void) {
             Require(Contains(history[@"notices"], @"801") && Contains(history[@"notices"], @"cumulative"), @"Historical errors explicitly cumulative");
             NSDictionary *retries = Present(@{@"deferred_renames":@2, @"next_retry":@1000, @"pending_jobs":@1});
             Require([retries[@"metrics"][2][@"value"] isEqual:@"2"] && [retries[@"tone"] isEqual:@"working"], @"A retry count alone must not demand user intervention");
-            Require(Contains(retries[@"notices"], @"Directory retry"), @"Delayed reconciliation retries are visible separately");
+            Require(Contains(retries[@"automaticRetrySummary"], @"retry") && !Contains(retries[@"notices"], @"Directory retry"), @"Retry details have one contextual summary without duplicated notices");
+            for (NSNumber *korean in @[@NO, @YES]) {
+                NSDictionary *retryJob = @{@"path":@"/Users/example/Documents/busy", @"reason":@"11", @"attempts":@1, @"next_retry":@1000};
+                NSMutableDictionary *state = [Snapshot(@{@"pending_jobs":@2, @"directory_retry_count":@2, @"deferred_renames":@0,
+                    @"next_retry":@1000, @"directory_retry_items":@[retryJob, retryJob]}) mutableCopy];
+                NSDictionary *waiting = JasoStatusPresentation(state, nil, korean.boolValue);
+                Require([waiting[@"title"] isEqual:korean.boolValue ? @"변경 사항 감지 중" : @"Watching for changes"], @"A queue containing only automatic retries keeps the overall watching headline");
+                Require([waiting[@"tone"] isEqual:@"good"] && [waiting[@"issues"] count] == 2, @"Watching remains active while per-item retry details stay available");
+                Require(Contains(waiting[@"automaticRetrySummary"], @"2") && ![waiting[@"actionIssueSummary"] length], @"Complete passive details have a compact count and no action warning");
+                Require(!Contains(waiting[@"notices"], @"retry") && !Contains(waiting[@"notices"], @"재시도"), @"Routine retries are not repeated in notices");
+                state[@"pending_jobs"] = @5;
+                Require([JasoStatusPresentation(state, nil, korean.boolValue)[@"title"] isEqual:korean.boolValue ? @"변경 사항 처리 중" : @"Processing changes"], @"Ordinary queued work retains the activity headline alongside retries");
+                state[@"paused"] = @YES;
+                NSDictionary *pausedDetails = JasoStatusPresentation(state, nil, korean.boolValue);
+                Require([pausedDetails[@"title"] isEqual:korean.boolValue ? @"일시정지됨" : @"Paused"] && Contains(pausedDetails[@"automaticRetryDetail"], korean.boolValue ? @"계속 진행" : @"resume"), @"Paused activity and retry resume guidance remain separate");
+                state[@"running"] = @NO;
+                Require([JasoStatusPresentation(state, nil, korean.boolValue)[@"title"] isEqual:korean.boolValue ? @"중지됨" : @"Stopped"], @"Stopped activity takes precedence over automatic retries");
+                state[@"running"] = @YES; state[@"paused"] = @NO; state[@"pending_recovery"] = @YES;
+                Require([JasoStatusPresentation(state, nil, korean.boolValue)[@"tone"] isEqual:@"warning"], @"Recovery remains prominent beside passive retries");
+                state[@"pending_recovery"] = @NO; state[@"deferred_renames"] = @1;
+                state[@"rename_retry_items"] = @[@{@"path":@"/Users/example/Documents/private", @"reason":@"13", @"attempts":@1}];
+                NSDictionary *mixed = JasoStatusPresentation(state, nil, korean.boolValue);
+                Require([mixed[@"tone"] isEqual:@"warning"] && [mixed[@"actionIssueSummary"] length] && [mixed[@"automaticRetrySummary"] length], @"Actionable and passive details have independent summaries");
+                state[@"directory_retry_count"] = @100;
+                NSDictionary *partial = JasoStatusPresentation(state, nil, korean.boolValue);
+                Require(!Contains(partial[@"automaticRetrySummary"], @"100") && Contains(partial[@"automaticRetryDetail"], korean.boolValue ? @"일부" : @"some"), @"Partial details do not invent an exact passive-item count");
+            }
             Require([Present(@{@"next_retry":@1000, @"pending_jobs":@1})[@"tone"] isEqual:@"working"], @"Scheduled automatic retries use a waiting state");
             NSDictionary *lockedCloud = Present(@{@"deferred_renames":@1, @"rename_retry_items":@[@{
                 @"path":@"/Users/example/Library/CloudStorage/GoogleDrive-example/.tmp/123/file.txt", @"reason":@"1", @"locked":@YES, @"attempts":@1, @"next_retry":@1000}]});
-            Require([lockedCloud[@"tone"] isEqual:@"working"], @"A locked cloud item waits rather than demanding manual unlock");
+            Require([lockedCloud[@"tone"] isEqual:@"good"], @"A locked cloud item preserves ongoing watching without demanding manual unlock");
             Require([lockedCloud[@"issues"] count] == 1 && Contains(lockedCloud[@"issues"], @"Wait for the sync app to release its managed lock"), @"Cloud lock guidance leaves managed locks to the sync app");
             Require([lockedCloud[@"issues"][0][@"action"] isEqual:@"reveal"] && Contains(lockedCloud[@"issues"][0][@"actionTitle"], @"Finder"), @"An issue offers the actual file location");
             NSString *cloudFile = @"/Users/example/Library/CloudStorage/GoogleDrive-example/.tmp/123/file.txt";
@@ -127,7 +261,7 @@ int main(void) {
                     @"directory_retry_items":@[@{@"path":directoryPath, @"reason":@"Operation not permitted (os error 1)", @"attempts":@1, @"next_retry":@1000}]});
                 for (NSNumber *korean in @[@NO, @YES]) {
                     NSDictionary *paired = JasoStatusPresentation(pairedCloudFailures, nil, korean.boolValue);
-                    Require([paired[@"tone"] isEqual:@"working"], @"A duplicate cloud EPERM must not override the saved lock's automatic wait guidance");
+                    Require([paired[@"tone"] isEqual:@"good"], @"A duplicate cloud EPERM must not override ongoing watching");
                     Require([paired[@"issues"] count] == 2, @"Both saved retry operations remain visible");
                     NSDictionary *directoryIssue = paired[@"issues"][1];
                     Require(![directoryIssue[@"requiresAction"] boolValue] && [directoryIssue[@"category"] isEqual:@"retry"], @"Bare cloud EPERM does not establish permission denial or a lock");
@@ -136,7 +270,23 @@ int main(void) {
                 }
             }
             NSDictionary *unknownCloud = Present(@{@"deferred_renames":@1, @"rename_retry_items":@[@{@"path":cloudFile, @"reason":@"1"}]});
-            Require([unknownCloud[@"tone"] isEqual:@"working"] && [unknownCloud[@"issues"][0][@"category"] isEqual:@"retry"], @"A cloud rename EPERM without saved lock evidence stays uncertain");
+            Require([unknownCloud[@"tone"] isEqual:@"good"] && [unknownCloud[@"issues"][0][@"category"] isEqual:@"retry"], @"A cloud rename EPERM remains contextual while watching continues");
+            for (NSNumber *korean in @[@NO, @YES]) {
+              for (NSString *source in @[@"rename_retry_items", @"directory_retry_items"]) {
+                NSString *reason = [source isEqual:@"rename_retry_items"] ? @"dataless-file" : @"dataless file deferred; download state is not verified";
+                NSDictionary *cloudOnly = JasoStatusPresentation(Snapshot(@{@"deferred_renames":@([source isEqual:@"rename_retry_items"] ? 1 : 0),
+                    @"directory_retry_count":@([source isEqual:@"directory_retry_items"] ? 1 : 0), source:@[@{@"path":cloudFile,
+                    @"reason":reason, @"attempts":@245, @"next_retry":@1000}]}), nil, korean.boolValue);
+                NSDictionary *issue = [cloudOnly[@"issues"] firstObject];
+                Require([issue[@"category"] isEqual:@"cloud-only"], @"Cloud-only files have a specific waiting state");
+                Require(![issue[@"requiresAction"] boolValue], @"Repeated metadata checks cannot turn cloud-only storage into a user-action error");
+                Require([cloudOnly[@"tone"] isEqual:@"good"], @"An idle worker remains healthy while a cloud-only filename waits");
+                Require(Contains(issue, korean.boolValue ? @"이 Mac에" : @"this Mac"), @"Cloud-only guidance explains when filename cleanup resumes");
+                Require(!Contains(issue, @"245") && !Contains(issue, korean.boolValue ? @"실패" : @"failed"), @"Cloud-only waiting is not presented as hundreds of failed actions");
+                Require(Contains(cloudOnly[@"automaticRetrySummary"], korean.boolValue ? @"클라우드" : @"cloud"), @"The shared summary identifies cloud waiting");
+                Require(!Contains(cloudOnly[@"automaticRetryDetail"], korean.boolValue ? @"재시도 시각" : @"retry time"), @"Cloud waiting does not promise a displayed retry deadline");
+              }
+            }
             NSDictionary *cloudAccess = Present(@{@"directory_retry_items":@[@{@"path":cloudFile.stringByDeletingLastPathComponent, @"reason":@"Permission denied (os error 13)"}]});
             Require([cloudAccess[@"tone"] isEqual:@"warning"] && [cloudAccess[@"issues"][0][@"category"] isEqual:@"permission"], @"Cloud EACCES retains access-permission guidance");
             NSDictionary *localPermission = Present(@{@"rename_retry_items":@[@{@"path":@"/Users/example/Documents/file.txt", @"reason":@"1"}]});
@@ -147,7 +297,7 @@ int main(void) {
             Require(Contains(permission[@"issues"], @"Get Info") && Contains(permission[@"issues"], @"Full Disk Access"), @"Permission advice distinguishes ownership from privacy access");
             NSDictionary *busy = Present(@{@"directory_retry_count":@1, @"next_retry":@1000, @"pending_jobs":@1, @"directory_retry_items":@[@{
                 @"path":@"/Users/example/Library/CloudStorage/OneDrive/Documents", @"reason":@"Resource deadlock avoided (os error 11)", @"attempts":@2, @"next_retry":@1000}]});
-            Require([busy[@"tone"] isEqual:@"working"] && Contains(busy[@"issues"], @"automatically"), @"Temporary cloud read failure explains automatic retry");
+            Require([busy[@"tone"] isEqual:@"good"] && Contains(busy[@"issues"], @"automatically"), @"Temporary cloud read failure explains automatic retry while watching continues");
             Require(!Contains(busy[@"issues"], @"Full Disk Access"), @"A busy file is not misdiagnosed as missing permission");
             for (NSNumber *korean in @[@NO, @YES]) {
                 NSString *accountPath = @"/Users/example/Library/CloudStorage/Nextcloud-account/Documents";

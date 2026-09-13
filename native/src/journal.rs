@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -383,7 +384,7 @@ impl Journal {
         Ok(())
     }
 }
-pub fn visit_records(path: &Path, mut visitor: impl FnMut(Value) -> Result<()>) -> Result<()> {
+pub fn record_sources(path: &Path) -> Result<Vec<PathBuf>> {
     let history = suffix(path, ".history");
     let mut segments = BTreeMap::<String, PathBuf>::new();
     if history.is_dir() {
@@ -399,29 +400,283 @@ pub fn visit_records(path: &Path, mut visitor: impl FnMut(Value) -> Result<()>) 
             }
         }
     }
-    let mut sources: Vec<PathBuf> = segments.into_values().collect();
+    let recovery = suffix(path, ".recovery.jsonl");
+    let mut sources: Vec<PathBuf> = recovery.exists().then_some(recovery).into_iter().collect();
+    sources.extend(segments.into_values());
     if path.exists() {
         sources.push(path.to_path_buf());
     } else if sources.is_empty() {
         return Err(io::Error::from_raw_os_error(libc::ENOENT).into());
     }
-    for source in sources {
-        let file = File::open(&source)?;
-        let stream: Box<dyn Read> = if source.extension().is_some_and(|e| e == "gz") {
-            Box::new(GzDecoder::new(file))
-        } else {
-            Box::new(file)
-        };
-        for line in BufReader::new(stream).lines() {
-            let line = line?;
-            if !line.trim().is_empty() {
-                visitor(
-                    serde_json::from_str(&line).with_context(|| {
-                        format!("invalid journal record in {}", source.display())
-                    })?,
-                )?;
+    Ok(sources)
+}
+#[derive(Default, Debug, Serialize)]
+pub struct ArchiveMaintenance {
+    pub archives_removed: usize,
+    pub recovery_records_retained: usize,
+}
+
+fn visit_source(source: &Path, mut visitor: impl FnMut(Value) -> Result<()>) -> Result<()> {
+    let file = File::open(source)?;
+    let stream: Box<dyn Read> = if source.extension().is_some_and(|e| e == "gz") {
+        Box::new(GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = Vec::new();
+        let length = reader
+            .by_ref()
+            .take(1024 * 1024 + 1)
+            .read_until(b'\n', &mut line)?;
+        if length == 0 {
+            break;
+        }
+        if length > 1024 * 1024 {
+            bail!("journal record exceeds the safe read limit");
+        }
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            let record: Value = serde_json::from_slice(&line)
+                .with_context(|| format!("invalid journal record in {}", source.display()))?;
+            if !record.is_object() {
+                bail!("journal record is not an object in {}", source.display());
+            }
+            visitor(record)?;
+        }
+    }
+    Ok(())
+}
+
+fn archived_bytes(path: &Path) -> Result<u64> {
+    let mut file = File::open(path)?;
+    if path.extension().is_some_and(|e| e == "gz") {
+        // Rotated segments are smaller than 4 GiB; the gzip trailer records
+        // their original size. Expired segments are fully validated below.
+        file.seek(SeekFrom::End(-4))?;
+        let mut size = [0; 4];
+        file.read_exact(&mut size)?;
+        Ok(u32::from_le_bytes(size).into())
+    } else {
+        Ok(file.metadata()?.len())
+    }
+}
+
+fn files_equal(left: &Path, right: &Path) -> Result<bool> {
+    if !left.exists() || fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = BufReader::new(File::open(left)?);
+    let mut right = BufReader::new(File::open(right)?);
+    loop {
+        let a = left.fill_buf()?;
+        let b = right.fill_buf()?;
+        if a != b {
+            return Ok(false);
+        }
+        let len = a.len();
+        if len == 0 {
+            return Ok(true);
+        }
+        left.consume(len);
+        right.consume(len);
+    }
+}
+
+/// Check the owned entry itself without rejecting platform aliases in its
+/// ancestors (for example /var on macOS). Missing entries may be created later.
+pub(crate) fn retention_path(path: &Path, directory: bool) -> Result<bool> {
+    // A trailing slash asks lstat to dereference a directory symlink; remove
+    // that syntactic suffix before checking the owned entry itself.
+    let entry: PathBuf = path.components().collect();
+    match fs::symlink_metadata(&entry) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || if directory {
+                    !metadata.is_dir()
+                } else {
+                    !metadata.is_file()
+                }
+            {
+                bail!(
+                    "retention path is not a regular {}: {}",
+                    if directory { "directory" } else { "file" },
+                    path.display()
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn validate_retention_journal(path: &Path) -> Result<()> {
+    retention_path(path.parent().unwrap_or(Path::new(".")), true)?;
+    retention_path(path, false)?;
+    retention_path(&suffix(path, ".recovery.jsonl"), false)?;
+    let history = suffix(path, ".history");
+    if retention_path(&history, true)? {
+        for entry in fs::read_dir(history)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".jsonl") || name.ends_with(".jsonl.gz") {
+                retention_path(&entry.path(), false)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Caller holds JournalLocks and the runtime lock. Keep a contiguous recent
+/// suffix, so every retained completed rename retains all its later events.
+/// Recovery evidence is published durably before any source is removed.
+pub fn maintain_archives(
+    path: &Path,
+    protected_ids: &BTreeSet<String>,
+) -> Result<ArchiveMaintenance> {
+    const ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
+    validate_retention_journal(path)?;
+    let recovery = suffix(path, ".recovery.jsonl");
+    if !path.exists() && !suffix(path, ".history").exists() && !recovery.exists() {
+        return Ok(ArchiveMaintenance::default());
+    }
+    if path.exists() && fs::metadata(path)?.len() >= 8 * 1024 * 1024 {
+        Journal::standard(path)?.rotate()?;
+    }
+    let sources = record_sources(path)?;
+    let archives: Vec<_> = sources
+        .iter()
+        .filter(|p| **p != recovery && **p != path)
+        .collect();
+    let mut first_retained = archives.len();
+    let mut bytes = 0u64;
+    for source in archives.iter().rev().take(2) {
+        bytes = bytes.saturating_add(archived_bytes(source)?);
+        if bytes > ARCHIVE_BYTES {
+            break;
+        }
+        first_retained -= 1;
+    }
+    let expired = &archives[..first_retained];
+    if expired.is_empty() && !recovery.exists() {
+        return Ok(ArchiveMaintenance::default());
+    }
+    let mut retained = BTreeMap::<String, Value>::new();
+    let key = |record: &Value| -> Result<String> {
+        if let Some(id) = record["operation_id"].as_str() {
+            return Ok(id.to_owned());
+        }
+        let mut identity = record.clone();
+        identity
+            .as_object_mut()
+            .unwrap()
+            .remove("history_retention_incomplete");
+        Ok(format!(
+            "legacy-{:x}",
+            Sha256::digest(serde_json::to_vec(&identity)?)
+        ))
+    };
+    // Memory grows only with unresolved/protected facts, never with ordinary
+    // completed history. Repeated diagnostics for an operation collapse.
+    for source in recovery
+        .exists()
+        .then_some(&recovery)
+        .into_iter()
+        .chain(expired.iter().copied())
+    {
+        visit_source(source, |mut record| {
+            let id = key(&record)?;
+            let committed = matches!(record["status"].as_str(), Some("renamed" | "reverted"));
+            if protected_ids.contains(&id)
+                || (!committed
+                    && (record["recovery_required"] == true
+                        || record["status"].as_str() != Some("error")))
+            {
+                if !committed
+                    && retained.get(&id).is_some_and(|prior| {
+                        matches!(prior["status"].as_str(), Some("renamed" | "reverted"))
+                    })
+                {
+                    return Ok(());
+                }
+                record["history_retention_incomplete"] = json!(true);
+                retained.insert(id, record);
+            } else {
+                retained.remove(&id);
+            }
+            Ok(())
+        })?;
+    }
+    for source in archives[first_retained..]
+        .iter()
+        .map(|source| source.as_path())
+        .chain(path.exists().then_some(path))
+    {
+        visit_source(source, |record| {
+            if matches!(record["status"].as_str(), Some("renamed" | "reverted")) {
+                retained.remove(&key(&record)?);
+            }
+            Ok(())
+        })?;
+    }
+    let temporary = suffix(
+        &recovery,
+        &format!(".{}.tmp", uuid::Uuid::new_v4().simple()),
+    );
+    let publish = (|| -> Result<()> {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        for record in retained.values() {
+            serde_json::to_writer(&mut output, record)?;
+            output.write_all(b"\n")?;
+        }
+        sync_file(&output)?;
+        if files_equal(&recovery, &temporary)? {
+            fs::remove_file(&temporary)?;
+            return Ok(());
+        }
+        fs::rename(&temporary, &recovery)?;
+        sync_directory(path.parent().unwrap_or(Path::new(".")))?;
+        Ok(())
+    })();
+    if publish.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    publish?;
+    for source in expired {
+        // Python archives can contain a plain/compressed twin. Removing both
+        // prevents a supposedly expired segment reappearing on cache rebuild.
+        let raw = if source.extension().is_some_and(|e| e == "gz") {
+            source.with_extension("")
+        } else {
+            source.to_path_buf()
+        };
+        for candidate in [&raw, &suffix(&raw, ".gz")] {
+            match fs::remove_file(candidate) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                result => result?,
+            }
+        }
+    }
+    if !expired.is_empty() {
+        sync_directory(&suffix(path, ".history"))?;
+    }
+    if retained.is_empty() {
+        fs::remove_file(&recovery)?;
+        sync_directory(path.parent().unwrap_or(Path::new(".")))?;
+    }
+    Ok(ArchiveMaintenance {
+        archives_removed: expired.len(),
+        recovery_records_retained: retained.len(),
+    })
+}
+pub fn visit_records(path: &Path, mut visitor: impl FnMut(Value) -> Result<()>) -> Result<()> {
+    for source in record_sources(path)? {
+        visit_source(&source, &mut visitor)?;
     }
     Ok(())
 }
@@ -440,6 +695,118 @@ pub fn revert(log: &Path, output: Option<&Path>) -> Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn archive_retention_rejects_symlink_surfaces_before_deleting_archives() {
+        use std::os::unix::fs::symlink;
+        for surface in ["active", "recovery", "history", "segment"] {
+            let temp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let path = temp.path().join("history.jsonl");
+            let history = suffix(&path, ".history");
+            let source_dir = if surface == "history" {
+                outside.path().to_path_buf()
+            } else {
+                history.clone()
+            };
+            fs::create_dir_all(&source_dir).unwrap();
+            for name in ["0001.jsonl", "0002.jsonl", "0003.jsonl"] {
+                fs::write(source_dir.join(name), b"{\"status\":\"renamed\"}\n").unwrap();
+            }
+            let foreign = outside.path().join("foreign.jsonl");
+            fs::write(
+                &foreign,
+                b"{\"status\":\"error\",\"recovery_required\":true}\n",
+            )
+            .unwrap();
+            match surface {
+                "active" => symlink(&foreign, &path).unwrap(),
+                "recovery" => symlink(&foreign, suffix(&path, ".recovery.jsonl")).unwrap(),
+                "history" => symlink(&source_dir, &history).unwrap(),
+                "segment" => {
+                    fs::remove_file(source_dir.join("0001.jsonl")).unwrap();
+                    symlink(&foreign, source_dir.join("0001.jsonl")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = maintain_archives(&path, &BTreeSet::new());
+            assert!(
+                source_dir.join("0001.jsonl").symlink_metadata().is_ok(),
+                "{surface}: preflight must precede deletion"
+            );
+            assert!(
+                result.is_err(),
+                "{surface}: symlink retention surface was accepted"
+            );
+            assert_eq!(
+                fs::read(&foreign).unwrap(),
+                b"{\"status\":\"error\",\"recovery_required\":true}\n"
+            );
+        }
+    }
+    #[test]
+    fn archive_retention_keeps_committed_pending_fact_after_a_later_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.jsonl");
+        let mut log = Journal::new(&path, 1, 1024, 3).unwrap();
+        log.emit(&json!({"status":"renamed","operation_id":"pending"}))
+            .unwrap();
+        log.emit(&json!({"status":"error","operation_id":"pending","recovery_required":true}))
+            .unwrap();
+        for id in ["recent-one", "recent-two"] {
+            log.emit(&json!({"status":"renamed","operation_id":id}))
+                .unwrap();
+        }
+        drop(log);
+        maintain_archives(&path, &BTreeSet::from(["pending".into()])).unwrap();
+        let records = journal_records(&path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .find(|r| r["operation_id"] == "pending")
+                .unwrap()["status"],
+            "renamed",
+            "a diagnostic must not erase the committed recovery confirmation"
+        );
+    }
+
+    #[test]
+    fn archive_retention_rejects_non_object_evidence_without_deleting_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.jsonl");
+        let history = suffix(&path, ".history");
+        fs::create_dir(&history).unwrap();
+        fs::write(history.join("0001.jsonl"), b"null\n").unwrap();
+        for name in ["0002.jsonl", "0003.jsonl"] {
+            fs::write(history.join(name), b"{\"status\":\"renamed\"}\n").unwrap();
+        }
+        assert!(maintain_archives(&path, &BTreeSet::new()).is_err());
+        assert_eq!(fs::read_dir(history).unwrap().count(), 3);
+    }
+    #[test]
+    fn interrupted_retention_deduplicates_legacy_recovery_without_operation_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.jsonl");
+        let history = suffix(&path, ".history");
+        fs::create_dir(&history).unwrap();
+        fs::write(
+            history.join("0001.jsonl"),
+            b"{\"status\":\"error\",\"recovery_required\":true}\n",
+        )
+        .unwrap();
+        fs::write(suffix(&path, ".recovery.jsonl"), b"{\"status\":\"error\",\"recovery_required\":true,\"history_retention_incomplete\":true}\n").unwrap();
+        for name in ["0002.jsonl", "0003.jsonl"] {
+            fs::write(history.join(name), b"{\"status\":\"renamed\"}\n").unwrap();
+        }
+        maintain_archives(&path, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            journal_records(&path)
+                .unwrap()
+                .iter()
+                .filter(|row| row["recovery_required"] == true)
+                .count(),
+            1
+        );
+    }
     #[test]
     fn retained_archives_survive_rotation_and_diagnostics_are_bounded() {
         let temp = tempfile::tempdir().unwrap();

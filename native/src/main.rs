@@ -31,6 +31,17 @@ enum Command {
     },
     /// Show persisted progress and actual worker state.
     Status(Options),
+    /// Read the worker's live activity without waiting for directory operations.
+    Activity(Options),
+    /// Show storage used by Jaso and free capacity on its data volumes.
+    Storage(Options),
+    /// Compact app data while the worker is stopped.
+    Maintain(Options),
+    /// Browse changes and request restoration of one original name.
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
     /// Queue a subtree (or the configured roots) for reconciliation.
     Reconcile {
         #[command(flatten)]
@@ -72,6 +83,14 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum SetupCommand {
+    StartDrive {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        uuid: String,
+        #[arg(long)]
+        revision: String,
+    },
     Read {
         #[arg(long)]
         config: PathBuf,
@@ -91,6 +110,47 @@ enum SetupCommand {
         revision: String,
         #[arg(long)]
         start: bool,
+    },
+}
+#[derive(Subcommand)]
+enum HistoryCommand {
+    List {
+        #[command(flatten)]
+        options: Options,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value = "")]
+        search: String,
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long)]
+        result: Option<String>,
+    },
+    Preview {
+        #[command(flatten)]
+        options: Options,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        revision: String,
+    },
+    Restore {
+        #[command(flatten)]
+        options: Options,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        revision: String,
+    },
+    Result {
+        #[command(flatten)]
+        options: Options,
+        #[arg(long)]
+        request_id: String,
     },
 }
 #[derive(Args, Default)]
@@ -173,6 +233,11 @@ fn execute(command: Command) -> Result<()> {
         Command::Setup { command } => {
             use jaso_nfc::setup;
             output(match command {
+                SetupCommand::StartDrive {
+                    config,
+                    uuid,
+                    revision,
+                } => setup::start_drive(&config, &uuid, &revision)?,
                 SetupCommand::Read { config } => setup::read(&config)?,
                 SetupCommand::Preview { config, draft } => {
                     setup::preview(&config, &setup::Draft::parse(&draft)?)?
@@ -201,6 +266,78 @@ fn execute(command: Command) -> Result<()> {
         }
         Command::Status(options) => {
             output(service::runtime_status(&configuration(&options, false)?)?)
+        }
+        Command::Storage(options) => output(jaso_nfc::storage::snapshot(&configuration(
+            &options, false,
+        )?)?),
+        Command::Maintain(options) => {
+            let config = configuration(&options, false)?;
+            let _lock = control::RuntimeLock::acquire(&config, Duration::ZERO)?;
+            let before = jaso_nfc::storage::snapshot(&config)?;
+            let index_path = config.state_path("index.sqlite3");
+            if index_path.exists() {
+                drop(jaso_nfc::index::Index::new(&index_path, false)?);
+            }
+            let history = jaso_nfc::history::maintain(&config)?;
+            let backups_removed =
+                jaso_nfc::retention::prune_backups(std::path::Path::new(&config.state_dir))?;
+            output(
+                json!({"before":before,"after":jaso_nfc::storage::snapshot(&config)?,"history":history,"backups_removed":backups_removed}),
+            );
+        }
+        Command::Activity(options) => output(jaso_nfc::activity_transport::snapshot_for(
+            &configuration(&options, false)?,
+        )?),
+        Command::History { command } => {
+            use jaso_nfc::history::{self, HistoryQuery, RestoreRequest};
+            output(match command {
+                HistoryCommand::List {
+                    options,
+                    limit,
+                    offset,
+                    search,
+                    date,
+                    result,
+                } => serde_json::to_value(history::list(
+                    &configuration(&options, false)?,
+                    &HistoryQuery {
+                        limit,
+                        offset,
+                        search,
+                        date,
+                        result,
+                    },
+                )?)?,
+                HistoryCommand::Preview {
+                    options,
+                    id,
+                    revision,
+                } => serde_json::to_value(history::preview(
+                    &configuration(&options, false)?,
+                    &id,
+                    &revision,
+                )?)?,
+                HistoryCommand::Restore {
+                    options,
+                    request_id,
+                    operation_id,
+                    revision,
+                } => serde_json::to_value(history::request_restore(
+                    &configuration(&options, false)?,
+                    &RestoreRequest {
+                        request_id,
+                        operation_id,
+                        revision,
+                    },
+                )?)?,
+                HistoryCommand::Result {
+                    options,
+                    request_id,
+                } => serde_json::to_value(history::restore_result(
+                    &configuration(&options, false)?,
+                    &request_id,
+                )?)?,
+            });
         }
         Command::Pause(options) | Command::Resume(options) => {
             unreachable!("handled before move: {:?}", options.config)
@@ -269,7 +406,11 @@ fn execute(command: Command) -> Result<()> {
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("");
-                        if jaso_nfc::policy::nfc(name) != name {
+                        if jaso_nfc::filename_repair::entry_target(
+                            name,
+                            entry.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32,
+                        ) != name
+                        {
                             candidates.push(entry.path);
                         }
                     }

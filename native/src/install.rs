@@ -275,9 +275,31 @@ fn bundle_stamp(info: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64)
         info.ctime_nsec(),
     )
 }
+#[derive(Debug)]
+struct BundleChanged(String);
+impl std::fmt::Display for BundleChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for BundleChanged {}
+
+#[cfg(test)]
+type TestBundleHashHook = Box<dyn FnMut(&std::fs::File, &[u8]) -> Result<()>>;
+#[cfg(test)]
+thread_local! {
+    static TEST_BUNDLE_HASH_HOOK: std::cell::RefCell<Option<TestBundleHashHook>> = const { std::cell::RefCell::new(None) };
+}
 fn hash_bundle_entry(file: &mut std::fs::File, path: &[u8], hash: &mut Sha256) -> Result<()> {
     use std::io::Read;
     let before = file.metadata()?;
+    #[cfg(test)]
+    TEST_BUNDLE_HASH_HOOK.with(|hook| -> Result<()> {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(file, path)?;
+        }
+        Ok(())
+    })?;
     ensure!(
         before.is_dir() || before.is_file(),
         "unsupported application bundle entry"
@@ -307,18 +329,26 @@ fn hash_bundle_entry(file: &mut std::fs::File, path: &[u8], hash: &mut Sha256) -
             hash.update(&buffer[..count]);
             length += count as u64;
         }
-        ensure!(
-            length == before.len(),
-            "application bundle file changed while hashing"
-        );
+        if length != before.len() {
+            return Err(BundleChanged(format!(
+                "application bundle file {} changed while hashing: expected {} bytes, read {length}",
+                String::from_utf8_lossy(path), before.len()
+            )).into());
+        }
     }
-    ensure!(
-        bundle_stamp(&before) == bundle_stamp(&file.metadata()?),
-        "application bundle changed while hashing"
-    );
+    let after = file.metadata()?;
+    if bundle_stamp(&before) != bundle_stamp(&after) {
+        return Err(BundleChanged(format!(
+            "application bundle entry {} changed while hashing: {:?} -> {:?}",
+            String::from_utf8_lossy(path),
+            bundle_stamp(&before),
+            bundle_stamp(&after)
+        ))
+        .into());
+    }
     Ok(())
 }
-fn bundle_digest(bundle: &Path) -> Result<String> {
+fn bundle_digest_once(bundle: &Path) -> Result<String> {
     use std::os::unix::fs::OpenOptionsExt;
     // Descriptor-relative traversal rejects links at every component. Hash only
     // relative names and file bytes, so identical copies have identical IDs.
@@ -330,6 +360,19 @@ fn bundle_digest(bundle: &Path) -> Result<String> {
     hash.update(b"jaso-nfc-bundle-v1\0");
     hash_bundle_entry(&mut directory, b"", &mut hash)?;
     Ok(format!("{:x}", hash.finalize()))
+}
+fn bundle_digest(bundle: &Path) -> Result<String> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match bundle_digest_once(bundle) {
+            // Discard the entire interrupted digest and all descriptors. A
+            // successful attempt still passes every stamp/link/length check;
+            // callers compare it against their previously accepted digest.
+            Err(error) if attempt < 3 && error.downcast_ref::<BundleChanged>().is_some() => {}
+            result => return result,
+        }
+    }
 }
 
 struct ClassifiedApplication {
@@ -726,6 +769,9 @@ pub fn install(config: &Config, source: &Path) -> Result<Value> {
         result?;
     }
     activate(config, &installed, &paths, &mut NativeHost { source })?;
+    if let Err(error) = crate::retention::prune_releases(Path::new(&config.state_dir), &installed) {
+        crate::service::diagnostic(config, &format!("release retention: {error:#}"));
+    }
     Ok(
         json!({"installed":paths.application,"application":paths.application,"rollback_release":installed,"launch_agent":paths.worker,"version":env!("CARGO_PKG_VERSION"),"recovery_history_retained":true}),
     )
@@ -1089,6 +1135,17 @@ fn activate(
                             .context("could not acquire runtime lock for rollback")?,
                     );
                 }
+                // A started replacement may already have migrated its index.
+                // Restore writable compatibility before restarting the previous
+                // worker; its history cache is reconstructed from the journals.
+                crate::index::restore_legacy_storage(config.state_path("index.sqlite3"))?;
+                for name in [
+                    "history.sqlite3",
+                    "history.sqlite3-wal",
+                    "history.sqlite3-shm",
+                ] {
+                    remove_optional(&config.state_path(name))?;
+                }
                 restore_artifacts(&files, &mut application)?;
             }
             // Never start the old worker while still owning its runtime lock.
@@ -1116,6 +1173,12 @@ fn activate(
     application.finish();
     if let Some(legacy) = &mut legacy {
         legacy.finish();
+    }
+    // A cleanup failure after activation must not undo a working installation.
+    if let Err(error) = crate::retention::mark_completed(&backup)
+        .and_then(|_| crate::retention::prune_backups(Path::new(&config.state_dir)))
+    {
+        crate::service::diagnostic(config, &format!("backup retention: {error:#}"));
     }
     Ok(())
 }
@@ -1250,6 +1313,142 @@ mod rollback_tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    fn with_bundle_hash_hook<T>(hook: TestBundleHashHook, body: impl FnOnce() -> T) -> T {
+        struct Reset(Option<TestBundleHashHook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_BUNDLE_HASH_HOOK.with(|hook| hook.replace(self.0.take()));
+            }
+        }
+        let _reset = Reset(TEST_BUNDLE_HASH_HOOK.with(|slot| slot.replace(Some(hook))));
+        body()
+    }
+
+    #[test]
+    fn bundle_hash_retries_one_metadata_change_with_a_fresh_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("fixture.app");
+        write_fixture_app(&bundle, b"unchanged app bytes");
+        let expected = bundle_digest(&bundle).unwrap();
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = attempts.clone();
+        let actual = with_bundle_hash_hook(
+            Box::new(move |file, path| {
+                if path.is_empty() {
+                    let count = observed.get() + 1;
+                    observed.set(count);
+                    if count == 1 {
+                        file.set_modified(
+                            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                        )?;
+                    }
+                }
+                Ok(())
+            }),
+            || bundle_digest(&bundle),
+        );
+        assert_eq!(actual.unwrap(), expected);
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn bundle_hash_rejects_persistent_metadata_changes_after_three_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("fixture.app");
+        write_fixture_app(&bundle, b"unchanged app bytes");
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = attempts.clone();
+        let error = with_bundle_hash_hook(
+            Box::new(move |file, path| {
+                if path.is_empty() {
+                    let count = observed.get() + 1;
+                    observed.set(count);
+                    file.set_modified(
+                        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(count),
+                    )?;
+                }
+                Ok(())
+            }),
+            || bundle_digest(&bundle),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed while hashing"));
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn bundle_hash_retry_does_not_accept_changed_application_contents() {
+        let f = Fixture::normal();
+        let mut application = ApplicationSwap::prepare(
+            &f.paths.application,
+            &f.installed,
+            &Path::new(&f.config.state_dir).join("releases"),
+        )
+        .unwrap();
+        let target = application.staged.join("Contents/MacOS/Jaso NFC");
+        let mut changed = false;
+        let error = with_bundle_hash_hook(
+            Box::new(move |file, path| {
+                if !changed && path == b"Contents/MacOS/Jaso NFC" {
+                    changed = true;
+                    std::fs::write(&target, b"changed application contents")?;
+                    file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1))?;
+                }
+                Ok(())
+            }),
+            || application.publish(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("staged application changed during installation"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_link(&f.paths.application).unwrap(),
+            f.old_link
+        );
+        assert!(!application.published);
+    }
+
+    #[test]
+    fn bundle_hash_never_retries_link_or_generic_io_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("fixture.app");
+        write_fixture_app(&bundle, b"unchanged app bytes");
+        std::os::unix::fs::symlink("Contents", bundle.join("link")).unwrap();
+        for injected_io in [false, true] {
+            let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed = attempts.clone();
+            let error = with_bundle_hash_hook(
+                Box::new(move |_, path| {
+                    if path.is_empty() {
+                        observed.set(observed.get() + 1);
+                        if injected_io {
+                            return Err(std::io::Error::from_raw_os_error(libc::EACCES).into());
+                        }
+                    }
+                    Ok(())
+                }),
+                || bundle_digest(&bundle),
+            )
+            .unwrap_err();
+            if injected_io {
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(libc::EACCES)
+                );
+            } else {
+                assert!(error.to_string().contains("unexpected symbolic link"));
+            }
+            assert_eq!(attempts.get(), 1);
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct JobState {
@@ -1603,6 +1802,15 @@ mod rollback_tests {
         assert_eq!(
             Config::load(&f.paths.config).unwrap().signature(),
             f.config.signature()
+        );
+        let backups: Vec<_> = std::fs::read_dir(Path::new(&f.config.state_dir).join("backups"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert!(
+            backups[0].join("completed.json").is_file(),
+            "successful install must enroll its backup in retention"
         );
     }
     #[test]
@@ -2381,9 +2589,28 @@ mod rollback_tests {
                 disabled: false,
             },
         );
+        let index_path = f.config.state_path("index.sqlite3");
+        drop(crate::index::Index::new(&index_path, false).unwrap());
+        let history_path = f.config.state_path("history.sqlite3");
+        std::fs::write(&history_path, b"rebuildable new history cache").unwrap();
         f.host.fail_once = Some(("disable".into(), LABEL.into()));
         assert!(f.activate().is_err());
         f.assert_restored();
+        let db = rusqlite::Connection::open(index_path).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT type FROM sqlite_master WHERE name='entries'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "table",
+            "rollback must restore a schema the previous worker can open"
+        );
+        assert!(
+            !history_path.exists(),
+            "old worker must rebuild its own cache schema"
+        );
     }
     #[test]
     fn login_state_parser_accepts_boolean_and_named_launchctl_formats() {

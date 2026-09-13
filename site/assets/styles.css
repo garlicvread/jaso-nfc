@@ -46,6 +46,11 @@ h1 em { font-style:normal; color:#65843e; }
 .filename small { font-size:21px; color:var(--muted); font-weight:400; }
 .check { border-radius:50%; background:var(--lime); color:var(--green); width:26px; height:26px; display:grid; place-items:center; font-size:14px; }
 .art-caption { font-size:11px; line-height:1.6; color:var(--muted); margin:20px 0 0; text-align:center; }
+.encoding-example { border-top:1px solid #cbd5c1; margin-top:24px; padding-top:18px; }
+.encoding-example p { margin:0 0 12px; }
+.encoding-example p:last-child { margin-bottom:0; }
+.encoding-example span { display:block; margin-bottom:4px; font-size:11px; color:var(--muted); }
+.encoding-example code { display:block; overflow-wrap:anywhere; font-size:14px; line-height:1.6; background:none; padding:0; }
 .quick-facts { display:grid; grid-template-columns:repeat(3,1fr); border-top:1px solid var(--line); border-bottom:1px solid var(--line); padding:24px 0; gap:28px; }
 .fact { display:flex; align-items:baseline; gap:12px; }
 .fact .number { color:#8a9d79; font-size:11px; }

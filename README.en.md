@@ -2,17 +2,24 @@
 
 [한국어](README.md) · English
 
-Tidy decomposed Korean filenames and automatically handle new files. Jaso NFC brings file and folder names into Unicode NFC form within your chosen folders. Its menu bar controls show current activity and items that need attention.
+Repair decomposed or garbled Korean filenames. Jaso NFC automatically cleans up names in your chosen folders and checks new files as they arrive. Preview proposed names and manage activity, folders, history, and settings in one window.
 
 [Product website](https://garlicvread.github.io/jaso-nfc/en/) · [User guide](docs/usage.en.md)
 
 ## Download
 
-[Download](https://github.com/garlicvread/jaso-nfc/releases/download/v0.1.0/Jaso-NFC-0.1.0-arm64-local.dmg)
+[Download](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.0/Jaso-NFC-0.2.0-arm64-local.dmg)
 
-0.1.0 · Apple Silicon Mac (M1 or later) · macOS 13 or later · Free / [MIT licensed](LICENSE)
+0.2.0 · Apple Silicon Mac (M1 or later) · macOS 13 or later · Free / [MIT licensed](LICENSE)
 
-Install the app and start with the Korean filenames in Downloads.
+## Which names can change?
+
+| Before | After |
+| --- | --- |
+| `ㅂㅗㄱㅗㅅㅓ.pdf` · letters stored as separate components | `보고서.pdf` · NFC form |
+| `µµÀüÀÇ IRÆ÷½ºÅÍ-ÃÖÁ¾º».pdf` · a name read using the wrong character encoding | `도전의 IR포스터-최종본.pdf` |
+
+Garbled filenames are repaired when there is sufficient evidence to recover the original characters. Check the result in `Preview filenames` first. Select a completed change in `History` to restore its original name.
 
 ## 1. Open the installer
 
@@ -23,44 +30,57 @@ Install the app and start with the Korean filenames in Downloads.
 
 The app is installed in Applications. If macOS blocks it, follow the [app opening instructions](docs/usage.en.md#if-macos-blocks-the-app).
 
-## 2. Review the files to rename
+## 2. Review folders and proposed names
 
-Choose Jaso NFC in the menu bar → `Manage folders…`. Select Downloads and choose `Preview filenames` to compare current and proposed names. Add other folders you need or remove them from the list.
+Choose `Open Jaso NFC…` from the menu bar, then select `Folders`. Pick Downloads and choose `Preview filenames` to compare current and proposed names. Add folders you need and exclude those you want to leave out.
 
-If you already use Jaso NFC, review your saved folder list first. See [folder selection and exclusions](docs/usage.en.md#change-folders) for the details.
+If you already use Jaso NFC, review your saved folder list first. Select external drives under `Drives`, and choose whether each drive resumes automatically or starts manually when reconnected.
+
+Choose `Remove from list` in a drive's details when you finish using it. Hidden folders such as `.ghost-alice` are excluded by default; select a folder directly when you want to include it.
 
 ## 3. Start automatic cleanup
 
-After reviewing the preview, choose `Start automatic cleanup`. Jaso NFC cleans up your selected folders and keeps checking new files. Choose `Open Status…` from the menu to see current activity and waiting items.
+After reviewing the preview, choose `Start automatic cleanup`. Jaso NFC checks the selected folders and new files as they arrive. If you paused the app earlier, choose `Resume` when ready.
 
-## Everyday controls
+Use `Status` to see today's changes and items needing attention. Choose `View activity` to see the current path and progress.
 
-| What you want to do | What to choose |
+## Everyday controls in one window
+
+| What you want to do | Tab or control |
 | --- | --- |
-| See activity and affected files | `Open Status…` |
-| Put cleanup on hold / continue | `Pause` / `Resume` |
-| Change the folders to clean up | `Manage folders…` |
-| Recheck a folder in your saved selection | `Open Status…` → `Recheck all watched roots` |
-| Choose login startup, language, and theme | `Settings…` |
-| Start stopped cleanup | `Start worker` |
+| See overall status and today's changes | `Status` |
+| Follow the current path and progress | `Activity`; optionally `Open in separate window` |
+| Manage folders, exclusions, and external drives | `Folders` |
+| Search changed names and restore an original name | `History` |
+| Choose login startup, language, and theme | `Settings` |
+| Check access permissions and storage | `Settings` → `Advanced settings` |
+| Put cleanup on hold / continue | Menu bar `Pause` / `Resume` |
 
-Close the window to leave cleanup running in the background. Choose `Quit Jaso NFC` to stop the work too. Next time, open the app and choose `Start worker`. Use `Settings…` → `Run at login` to choose whether it starts automatically when you log in.
+Use `Activity` to review recent work and items currently waiting. When a task stops, its entry shows the recorded cause, such as cloud storage or access permissions. A later successful check updates the entry with its completion result. Completed name changes remain in `History`. Select a history item to compare its original and changed name, check its location, and restore that item.
 
-## Solve a problem
+Each completed rename creates one change record. Checking the same file again updates progress, and retries for the same issue update its existing activity entry. Recent history stays within a storage budget, with older records retired automatically. See the space used by the file index, history, logs, and saved app versions in `Settings` → `Advanced settings` → `Storage usage…`.
 
-- For a folder that needs access permission, choose `Settings…` → `Open Full Disk Access…`, add and enable the installed Jaso NFC app, then choose `Restart worker` in Status.
-- For a cloud folder waiting to retry, open the path from Status in Finder and check the login and connection in your sync app.
-- For a name conflict or locked item, follow the reason and next step shown for that file in `File status`.
+Close the window to leave cleanup running in the background. Choose `Quit Jaso NFC` from the menu to stop the work too. Open the app from Applications when you want to use it again.
 
-[Status messages and next steps](docs/usage.en.md#permissions) · [Processing scope and exFAT precautions](docs/usage.en.md#scope-and-safety) · [Undo names and remove the app](docs/usage.en.md#recovery)
+## When you need help
+
+- For folder access permission, choose `Settings` → `Advanced settings` → `Open Full Disk Access…`, enable Jaso NFC, then choose `Restart cleanup`.
+- For a waiting cloud item, inspect the path and reason in `Activity` or `Status`, then check its connection and download state in Finder and your sync app.
+- Check available disk space in `Settings` → `Advanced settings` → `Storage usage…`.
+
+[Folders and drives](docs/usage.en.md#change-folders) · [Restore a name](docs/usage.en.md#recovery) · [Troubleshooting](docs/usage.en.md#permissions) · [Scope and safety](docs/usage.en.md#scope-and-safety)
 
 ## Help and support
 
-[Complete user guide](docs/usage.en.md) · [Installation and upgrades](docs/installation.md) · [Release notes](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.1.0)
+Open these instructions from `Settings` → `Open user guide…` in the app.
 
-Contact us through [GitHub issues](https://github.com/garlicvread/jaso-nfc/issues) or [aidall_manager@aidall.tech](mailto:aidall_manager@aidall.tech). Include the app version and status message to help us investigate. Remove private filenames and paths before sharing diagnostics.
+[Complete user guide](docs/usage.en.md) · [Installation and upgrades](docs/installation.md) · [Release notes](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.2.0)
+
+Contact us through [GitHub issues](https://github.com/garlicvread/jaso-nfc/issues) or [aidall_manager@aidall.tech](mailto:aidall_manager@aidall.tech). Include the app version and status message. Before sharing information copied from `Settings` → `Advanced settings`, remove private filenames and paths.
 
 Published by AidALL Inc.
+
+Contributor: [garlicvread](https://github.com/garlicvread) · [ceo@aidall.tech](mailto:ceo@aidall.tech)
 
 ## For developers
 

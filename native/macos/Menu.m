@@ -7,6 +7,7 @@
 #import <errno.h>
 #import "AnimatedMark.h"
 #import "StatusWindow.h"
+#import "WorkspaceWindow.h"
 #import "StatusPresentation.h"
 #import "Localization.h"
 #import "SettingsWindow.h"
@@ -256,7 +257,11 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
 @property NSString *configPath;
 @property NSString *workerPath;
 @property BOOL busy;
-@property JasoStatusWindowController *statusWindow;
+@property JasoWorkspaceWindowController *statusWindow;
+@property dispatch_queue_t activityQueue;
+@property dispatch_queue_t historyQueue;
+@property NSMutableSet<NSTask *> *queryTasks;
+@property dispatch_group_t queryGroup;
 @property NSString *statusError;
 @property NSDate *snapshotDate;
 @property BOOL refreshStartup;
@@ -271,7 +276,12 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
 
 @implementation JasoMenu
 - (instancetype)init {
-    if ((self = [super init])) _workerQueue = dispatch_queue_create("io.github.garlicvread.jaso-nfc.ui-commands", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    if ((self = [super init])) {
+        _workerQueue = dispatch_queue_create("io.github.garlicvread.jaso-nfc.ui-commands", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+        _activityQueue = dispatch_queue_create("io.github.garlicvread.jaso-nfc.activity", DISPATCH_QUEUE_SERIAL);
+        _queryTasks=NSMutableSet.new;_queryGroup=dispatch_group_create();
+        _historyQueue = dispatch_queue_create("io.github.garlicvread.jaso-nfc.history", DISPATCH_QUEUE_SERIAL);
+    }
     return self;
 }
 - (NSMenuItem *)item:(NSString *)title action:(SEL)action {
@@ -315,7 +325,7 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     NSMenu *windowMenu = [[NSMenu alloc] initWithTitle:windows.title];
     windows.submenu = windowMenu;
     [mainMenu addItem:windows];
-    [windowMenu addItem:JasoMenuCommand(L(@"Cleanup status…", @"파일명 정리 상태…"), @selector(details:), @"", self)];
+    [windowMenu addItem:JasoMenuCommand(L(@"Open Jaso NFC…", @"Jaso NFC 열기…"), @selector(details:), @"", self)];
     [windowMenu addItem:NSMenuItem.separatorItem];
     [windowMenu addItem:JasoMenuCommand(L(@"Close", @"닫기"), @selector(performClose:), @"w", nil)];
     [windowMenu addItem:JasoMenuCommand(L(@"Minimize", @"최소화"), @selector(performMiniaturize:), @"m", nil)];
@@ -346,7 +356,7 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     self.summaryView = [JasoMenuSummary new];
     NSMenuItem *summary = [self item:@"" action:nil]; summary.view = self.summaryView;
     [self.menu addItem:NSMenuItem.separatorItem];
-    [self item:L(@"Open Status…", @"상태 보기…") action:@selector(details:)];
+    [self item:L(@"Open Jaso NFC…", @"Jaso NFC 열기…") action:@selector(details:)];
     self.pauseItem = [self item:@"" action:@selector(togglePause:)];
     [self item:L(@"Manage folders…", @"정리할 폴더…") action:@selector(setup:)];
     [self.menu addItem:NSMenuItem.separatorItem];
@@ -379,21 +389,42 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     task.standardOutput = pipe;
     task.standardError = pipe;
     BOOL preview = arguments.count > 1 && [arguments[0] isEqual:@"setup"] && [arguments[1] isEqual:@"preview"];
+    BOOL query = [@[@"activity",@"history",@"status",@"storage"] containsObject:arguments.firstObject];
     NSError *launchError = nil;
     @synchronized (self) {
+        if((preview||query)&&self.quitting){*error=L(@"Jaso NFC is closing.",@"Jaso NFC를 종료하고 있습니다.");return nil;}
         if (preview && self.previewCancelled) { *error = L(@"Preview cancelled.", @"미리보기를 취소했습니다."); return nil; }
         if (![task launchAndReturnError:&launchError]) { *error = launchError.localizedDescription; return nil; }
         if (preview) self.previewTask = task;
+        if(preview||query){[self.queryTasks addObject:task];dispatch_group_enter(self.queryGroup);}
     }
-    if (preview) {
-        // The read-only preview is a separate child, so cancellation never
-        // interrupts the resident worker or a settings-save transaction.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            @synchronized (self) { if (self.previewTask == task && task.running) [task terminate]; }
+    __block BOOL timedOut = NO;
+    __block BOOL finished = NO;
+    if (preview || query) {
+        NSTimeInterval deadline=preview?30:[arguments.firstObject isEqual:@"activity"]?3:15;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(deadline*NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+            @synchronized(task) { if(finished || !task.running)return; timedOut=YES; [task terminate]; }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2*NSEC_PER_SEC),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+                @synchronized(task) { if(!finished && task.running)kill(task.processIdentifier,SIGKILL); }
+            });
         });
     }
-    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    NSMutableData *data=NSMutableData.new;
+    BOOL oversized=NO;
+    for (;;) {
+        NSData *part=[pipe.fileHandleForReading readDataOfLength:65536];
+        if(!part.length)break;
+        if(data.length+part.length<=8*1024*1024)[data appendData:part];
+        else { oversized=YES; if(preview||query){ @synchronized(task){if(task.running)[task terminate];} } }
+    }
     [task waitUntilExit];
+    @synchronized(task){finished=YES;}
+    if(preview||query){@synchronized(self){[self.queryTasks removeObject:task];}dispatch_group_leave(self.queryGroup);}
+    if (timedOut || oversized) {
+        if(preview) { @synchronized(self){if(self.previewTask==task)self.previewTask=nil;} }
+        *error = timedOut ? L(@"This request is taking longer than expected. Try again in a moment.",@"응답이 늦어지고 있습니다. 잠시 후 다시 시도하세요.") : L(@"There is too much information to show at once. Choose a smaller folder.",@"한 번에 표시할 항목이 많습니다. 더 작은 폴더를 선택하세요.");
+        return nil;
+    }
     if (preview) {
         @synchronized (self) { if (self.previewTask == task) self.previewTask = nil; }
         if (self.previewCancelled || task.terminationReason == NSTaskTerminationReasonUncaughtSignal) {
@@ -407,7 +438,7 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     return value;
 }
 - (NSArray *)configured:(NSArray *)arguments { return [arguments arrayByAddingObjectsFromArray:@[@"--config", self.configPath]]; }
-- (BOOL)applicationShouldHandleReopen:(NSApplication *)application hasVisibleWindows:(BOOL)flag { if (self.setupWindow) [self.setupWindow showWindow:nil]; else [self details:nil]; return YES; }
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)application hasVisibleWindows:(BOOL)flag { [self details:nil]; return YES; }
 - (void)menuWillOpen:(NSMenu *)menu { self.refreshStartup = YES; [self refresh]; }
 - (void)refresh {
     if (self.busy || self.setupBusy || self.quitting) return;
@@ -448,14 +479,8 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     });
 }
 - (void)updateMenuSnapshot {
-    NSDictionary *presentation = JasoStatusPresentation(self.snapshot, self.statusError, JasoUsesKorean());
+    NSDictionary *presentation = JasoWorkspaceStatus(self.snapshot, self.statusError, JasoUsesKorean());
     NSString *detail = presentation[@"subtitle"];
-    if (self.snapshot && !self.statusError) {
-        NSArray *metrics = presentation[@"metrics"];
-        NSUInteger unavailable = 0;
-        for (NSDictionary *location in presentation[@"locations"]) if ([location[@"tone"] isEqual:@"warning"]) unavailable++;
-        detail = [NSString stringWithFormat:L(@"%@ indexed · %@ queued\n%lu locations · %lu unavailable · %@ rename retries", @"확인 %@개 · 대기 %@개\n위치 %lu개 · 접근 불가 %lu개 · 변경 재시도 %@개"), metrics[0][@"value"], metrics[1][@"value"], (unsigned long)[presentation[@"locations"] count], (unsigned long)unavailable, metrics[2][@"value"]];
-    }
     [self.summaryView showTitle:presentation[@"title"] detail:detail];
     self.pauseItem.title = [presentation[@"primaryTitle"] length] ? presentation[@"primaryTitle"] : L(@"Worker control unavailable", @"작업 제어 확인 불가");
     self.pauseItem.hidden = ![presentation[@"primaryAction"] length];
@@ -483,7 +508,7 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     });
 }
 - (void)togglePause:(id)sender {
-    NSString *action = JasoStatusPresentation(self.snapshot, self.statusError, JasoUsesKorean())[@"primaryAction"];
+    NSString *action = JasoWorkspaceStatus(self.snapshot, self.statusError, JasoUsesKorean())[@"primaryAction"];
     if ([action isEqual:@"start"]) [self start:sender];
     else if ([@[@"pause", @"resume"] containsObject:action]) [self run:[self configured:@[action]]];
 }
@@ -498,7 +523,7 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     if (item.action==@selector(copyDiagnostics:)) return self.snapshot != nil;
     if (item.action==@selector(togglePause:)) {
-        NSString *action = JasoStatusPresentation(self.snapshot, self.statusError, JasoUsesKorean())[@"primaryAction"];
+        NSString *action = JasoWorkspaceStatus(self.snapshot, self.statusError, JasoUsesKorean())[@"primaryAction"];
         return !self.busy && !self.setupBusy && !self.quitting && [@[@"start", @"pause", @"resume"] containsObject:action];
     }
     if (item.action == @selector(setup:)) return !self.quitting;
@@ -506,25 +531,28 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
 }
 - (void)details:(id)sender {
     if (!self.statusWindow) {
-        self.statusWindow = [JasoStatusWindowController new];
+        self.statusWindow = [JasoWorkspaceWindowController new];
         __weak JasoMenu *weakSelf = self;
         self.statusWindow.refreshHandler = ^{ [weakSelf refresh]; };
         self.statusWindow.actionHandler = ^(NSString *action) {
             JasoMenu *menu = weakSelf;
             if ([action isEqual:@"start"]) [menu start:nil];
             else if ([action isEqual:@"pause"] || [action isEqual:@"resume"]) [menu run:[menu configured:@[action]]];
+            else if ([action isEqual:@"storage-settings"]) [menu openSystemSettings:@"x-apple.systempreferences:com.apple.settings.Storage"];
             else if ([action isEqual:@"permissions"]) [menu permissions:nil];
-            else if ([action isEqual:@"history"]) [menu openLogs:nil];
+            else if ([action isEqual:@"folders"]) [menu setup:nil];
+            else if ([action isEqual:@"cancel-preview"]) [menu cancelSetupPreview];
             else if ([action isEqual:@"settings"]) [menu settings:nil];
             else if ([action isEqual:@"restart"]) [menu run:@[@"restart"]];
             else if ([action isEqual:@"stop"]) [menu stop:nil];
             else if ([action isEqual:@"reconcile"]) [menu reconcileAll:nil];
         };
+        self.statusWindow.requestHandler = ^(NSString *request, NSDictionary *parameters, JasoWorkspaceReply reply) { [weakSelf requestWorkspace:request parameters:parameters reply:reply]; };
         self.statusWindow.diagnosticsHandler = ^{ [weakSelf copyDiagnostics:nil]; };
         self.statusWindow.pathHandler = ^(NSString *path) { [weakSelf revealPath:path]; };
         self.statusWindow.closeHandler = ^{
             JasoMenu *menu = weakSelf;
-            menu.statusWindow = nil;
+            [menu cancelSetupPreview];
             [menu updateActivationPolicy];
         };
     }
@@ -533,6 +561,23 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     [self.statusWindow setRefreshing:self.busy];
     [self.statusWindow showWindow:sender];
     [self refresh];
+}
+- (void)requestWorkspace:(NSString *)request parameters:(NSDictionary *)parameters reply:(JasoWorkspaceReply)reply {
+    if (self.quitting) { reply(nil, L(@"Jaso NFC is closing.", @"Jaso NFC를 종료하고 있습니다.")); return; }
+    NSMutableArray *arguments=NSMutableArray.new;
+    if ([@[@"activity",@"storage"] containsObject:request]) [arguments addObject:request];
+    else if ([request isEqual:@"history"]) {
+        [arguments addObjectsFromArray:@[@"history", @"list"]];
+        for (NSString *key in @[@"search",@"offset",@"limit",@"date",@"result"]) if (parameters[key]) [arguments addObjectsFromArray:@[[@"--" stringByAppendingString:key],[parameters[key] description]]];
+    } else if ([@[@"history-preview",@"history-restore",@"history-result"] containsObject:request]) {
+        [arguments addObjectsFromArray:@[@"history",[request substringFromIndex:8]]];
+        NSArray *keys=[request isEqual:@"history-preview"]?@[@"id",@"revision"]:[request isEqual:@"history-result"]?@[@"request_id"]:@[@"request_id",@"operation_id",@"revision"];
+        for (NSString *key in keys) if (parameters[key]) [arguments addObjectsFromArray:@[[@"--" stringByAppendingString:[key stringByReplacingOccurrencesOfString:@"_" withString:@"-"]],[parameters[key] description]]];
+    } else { reply(nil,L(@"This view could not be loaded.",@"화면을 불러오지 못했습니다.")); return; }
+    [arguments addObjectsFromArray:@[@"--config",self.configPath]];
+    dispatch_async([request isEqual:@"activity"]?self.activityQueue:self.historyQueue, ^{
+        @autoreleasepool { NSString *error=nil; NSDictionary *result=[self execute:arguments error:&error]; reply(result,error); }
+    });
 }
 - (void)copyDiagnostics:(id)sender {
     if (!self.snapshot) return;
@@ -548,16 +593,34 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     if (!JasoAbsolutePath(path)) return;
     [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
 }
+- (void)cancelReadTasks {
+    @synchronized(self){
+        self.previewCancelled=YES;
+        for(NSTask *task in self.queryTasks.copy)if(task.running){
+            [task terminate];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+                @synchronized(self){if([self.queryTasks containsObject:task]&&task.running)kill(task.processIdentifier,SIGKILL);}
+            });
+        }
+    }
+}
 - (void)cancelSetupPreview {
     @synchronized (self) {
         self.previewCancelled = YES;
-        if (self.previewTask.running) [self.previewTask terminate];
+        NSTask *task=self.previewTask;
+        if (task.running) {
+            [task terminate];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+                @synchronized(self){if(self.previewTask==task&&task.running)kill(task.processIdentifier,SIGKILL);}
+            });
+        }
     }
 }
 - (void)runSetup:(NSString *)operation draft:(NSDictionary *)draft revision:(NSString *)revision start:(BOOL)start {
     if (self.setupBusy || self.quitting || !self.setupWindow) return;
     JasoSetupWindowController *window = self.setupWindow;
-    NSMutableArray *arguments = [NSMutableArray arrayWithArray:@[@"setup", operation, @"--config", self.configPath]];
+    NSString *command = [operation isEqual:@"refresh-drives"] ? @"read" : operation;
+    NSMutableArray *arguments = [NSMutableArray arrayWithArray:@[@"setup", command, @"--config", self.configPath]];
     if (draft) {
         NSError *jsonError = nil;
         NSData *data = [NSJSONSerialization dataWithJSONObject:draft options:0 error:&jsonError];
@@ -579,7 +642,8 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
                 if (self.quitting) return;
                 if (self.setupWindow == window) {
                     [window setBusy:NO cancellable:NO];
-                    if ([operation isEqual:@"read"]) [window updateConfiguration:result error:error];
+                    if ([operation isEqual:@"refresh-drives"]) [window updateDriveInventory:result error:error];
+                    else if ([operation isEqual:@"read"]) [window updateConfiguration:result error:error];
                     else if (preview) [window updatePreview:result error:error];
                     else [window updateSave:result error:error];
                 }
@@ -605,6 +669,8 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
         self.setupWindow.previewHandler = ^(NSDictionary *draft) { [weakSelf runSetup:@"preview" draft:draft revision:nil start:NO]; };
         self.setupWindow.saveHandler = ^(NSDictionary *draft, NSString *revision, BOOL start) { [weakSelf runSetup:@"save" draft:draft revision:revision start:start]; };
         self.setupWindow.reloadHandler = ^{ [weakSelf runSetup:@"read" draft:nil revision:nil start:NO]; };
+        self.setupWindow.refreshDrivesHandler = ^{ [weakSelf runSetup:@"refresh-drives" draft:nil revision:nil start:NO]; };
+        self.setupWindow.startDriveHandler = ^(NSString *uuid,NSString *revision) { [weakSelf startDrive:uuid revision:revision]; };
         self.setupWindow.cancelHandler = ^{ [weakSelf cancelSetupPreview]; };
         self.setupWindow.closeHandler = ^{
             JasoMenu *menu = weakSelf;
@@ -613,24 +679,36 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
             [menu updateActivationPolicy];
         };
     }
-    [self.setupWindow showWindow:sender];
+    if (!self.statusWindow) [self details:nil];
+    [self.statusWindow embedView:[self.setupWindow embeddedContentViewForWindow:self.statusWindow.window] inSection:@"folders"];
+    [self.statusWindow selectSection:@"folders"];
+    [self.statusWindow showWindow:sender];
     if (self.configPath.length) [NSUserDefaults.standardUserDefaults setBool:YES forKey:[@"setupPresented:" stringByAppendingString:self.configPath]];
     if (created) [self runSetup:@"read" draft:nil revision:nil start:NO];
+}
+- (void)startDrive:(NSString *)uuid revision:(NSString *)revision {
+    if(self.setupBusy||self.quitting)return;self.setupBusy=YES;[self.setupWindow setBusy:YES cancellable:NO];
+    dispatch_async(self.workerQueue,^{@autoreleasepool {NSString *error=nil;NSDictionary *result=[self execute:@[@"setup",@"start-drive",@"--config",self.configPath,@"--uuid",uuid,@"--revision",revision] error:&error];dispatch_async(dispatch_get_main_queue(),^{self.setupBusy=NO;[self.setupWindow setBusy:NO cancellable:NO];[self.setupWindow updateDriveStart:result error:error];[self refresh];});}});
 }
 - (void)settings:(id)sender {
     if (!self.settingsWindow) {
         self.settingsWindow = [JasoSettingsWindowController new];
         __weak JasoMenu *weakSelf = self;
+        self.settingsWindow.storageHandler = ^{ [weakSelf.statusWindow showStorage:nil]; };
         self.settingsWindow.languageChangedHandler = ^{ [weakSelf languageChanged]; };
         self.settingsWindow.appearanceChangedHandler = ^{ [weakSelf updateAppearance]; };
         self.settingsWindow.startupChangedHandler = ^(BOOL enabled) { [weakSelf run:@[@"startup", enabled ? @"on" : @"off"]]; };
         self.settingsWindow.availableStyles = @[@(JasoMarkStyleAvailable(0)), @(JasoMarkStyleAvailable(1)), @(JasoMarkStyleAvailable(2))];
         self.settingsWindow.actionHandler = ^(NSString *action) {
             JasoMenu *menu = weakSelf;
-            if ([action isEqual:@"login-items"]) [menu openLoginItems:nil];
+            if ([action isEqual:@"reconcile"]) [menu reconcileAll:nil];
+            else if ([action isEqual:@"restart"]) [menu run:@[@"restart"]];
+            else if ([action isEqual:@"diagnostics"]) [menu copyDiagnostics:nil];
+            else if ([action isEqual:@"login-items"]) [menu openLoginItems:nil];
             else if ([action isEqual:@"setup"]) [menu setup:nil];
             else if ([action isEqual:@"full-disk-access"]) [menu openFullDiskAccess:nil];
             else if ([action isEqual:@"reveal-app"]) [menu showInstalledApp:nil];
+            else if ([action isEqual:@"user-guide"]) [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:L(@"https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.en.md", @"https://github.com/garlicvread/jaso-nfc/blob/main/docs/usage.md")]];
         };
         self.settingsWindow.closeHandler = ^{
             JasoMenu *menu = weakSelf;
@@ -640,7 +718,10 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     }
     [self updateActivationPolicy];
     [self.settingsWindow updateStartupEnabled:self.startupEnabled error:self.startupError busy:self.busy];
-    [self.settingsWindow showWindow:sender];
+    if (!self.statusWindow) [self details:nil];
+    [self.statusWindow embedView:[self.settingsWindow embeddedContentViewForWindow:self.statusWindow.window] inSection:@"settings"];
+    [self.statusWindow selectSection:@"settings"];
+    [self.statusWindow showWindow:sender];
     self.refreshStartup = YES;
     [self refresh];
 }
@@ -649,16 +730,8 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     @try {
         [self rebuildMenu];
         [self.setupWindow reloadLocalization];
-        if (self.statusWindow) {
-            NSRect frame = self.statusWindow.window.frame;
-            BOOL visible = self.statusWindow.window.visible;
-            [self.statusWindow close];
-            if (visible) {
-                [self details:nil];
-                [self.statusWindow.window setFrame:frame display:YES];
-            }
-        }
-        [self.settingsWindow.window makeKeyAndOrderFront:nil];
+        [self.statusWindow reloadLocalization];
+        [self.statusWindow.window makeKeyAndOrderFront:nil];
     } @finally {
         self.rebuildingWindows = NO;
         [self updateActivationPolicy];
@@ -692,6 +765,7 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)application {
     if (self.quitting) return NSTerminateLater;
     self.quitting = YES;
+    [self cancelReadTasks];
     [self.summaryView showTitle:L(@"Stopping worker…", @"백그라운드 작업 중지 중…") detail:L(@"Jaso NFC will quit when shutdown is confirmed.", @"진행 중인 작업을 마무리한 뒤 종료합니다.")];
     [self.statusWindow setRefreshing:YES];
     [self.settingsWindow updateStartupEnabled:self.startupEnabled error:self.startupError busy:YES];
@@ -699,7 +773,9 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
         @autoreleasepool {
             NSString *error = nil;
             NSDictionary *result = [self execute:@[@"stop"] error:&error];
-            BOOL stopped = !error && [result[@"stopped"] isEqual:@"io.github.garlicvread.jaso-nfc"];
+            BOOL queriesStopped=dispatch_group_wait(self.queryGroup,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC))==0;
+            BOOL stopped = queriesStopped && !error && [result[@"stopped"] isEqual:@"io.github.garlicvread.jaso-nfc"];
+            if(!queriesStopped)error=L(@"A background request is still closing. Try quitting again in a moment.",@"진행 중인 조회를 종료하고 있습니다. 잠시 후 다시 종료하세요.");
             if (!stopped && !error) error = L(@"Worker shutdown was not confirmed. Jaso NFC remains open.", @"작업이 아직 실행 중입니다. 잠시 후 다시 종료하세요.");
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.quitting = NO;

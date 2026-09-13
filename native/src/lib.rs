@@ -1,3 +1,5 @@
+pub mod activity;
+pub mod activity_transport;
 #[cfg(feature = "runtime")]
 pub mod app_bundle;
 pub mod config;
@@ -7,6 +9,9 @@ pub mod coverage;
 pub mod directory_io;
 #[cfg(feature = "platform")]
 pub mod events;
+pub mod filename_repair;
+#[cfg(feature = "normalizer")]
+pub mod history;
 #[cfg(feature = "index")]
 pub mod index;
 #[cfg(feature = "runtime")]
@@ -21,9 +26,13 @@ pub mod native_names;
 #[cfg(feature = "normalizer")]
 pub mod normalizer;
 pub mod policy;
+#[cfg(feature = "normalizer")]
+pub mod restore_hold;
+pub mod retention;
 #[cfg(feature = "runtime")]
 pub mod service;
 #[cfg(feature = "runtime")]
 pub mod setup;
 #[cfg(feature = "runtime")]
 pub mod sources;
+pub mod storage;

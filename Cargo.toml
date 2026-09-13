@@ -1,6 +1,6 @@
 [package]
 name = "jaso-nfc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Low-overhead, event-driven NFC filename normalization for macOS"
@@ -24,6 +24,7 @@ runtime = ["index", "normalizer", "platform"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+encoding_rs = "0.8"
 flate2 = "1"
 libc = "0.2"
 rusqlite = "0.40.2"

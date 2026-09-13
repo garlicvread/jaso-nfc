@@ -11,7 +11,9 @@ pub(crate) fn metadata(path: &std::path::Path, follow: bool) -> io::Result<libc:
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in metadata path"))?;
     let deadline = DirectoryIo::begin()?;
-    let _materialization = DirectoryMaterialization::begin()?;
+    let _materialization = DirectoryMaterialization::deny()?;
+    let display = path.to_string_lossy();
+    crate::activity::current(|a| a.begin("reading_metadata", Some(&display)));
     let mut info = std::mem::MaybeUninit::uninit();
     let code = unsafe {
         if follow {
@@ -21,10 +23,32 @@ pub(crate) fn metadata(path: &std::path::Path, follow: bool) -> io::Result<libc:
         }
     };
     let error = (code < 0).then(io::Error::last_os_error);
-    deadline.progress()?;
+    let error = deadline.progress().err().or(error);
     match error {
-        Some(error) => Err(error),
-        None => Ok(unsafe { info.assume_init() }),
+        Some(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Files can disappear between an event and its metadata probe.
+            // Preserve absence for callers without presenting a failed check.
+            crate::activity::current(|a| a.finish("reading_metadata", Some(&display)));
+            Err(error)
+        }
+        Some(error) => {
+            crate::activity::current(|a| {
+                a.failed_with_reason(
+                    "reading_metadata",
+                    Some(&display),
+                    Some(&error.to_string()),
+                    error.raw_os_error(),
+                )
+            });
+            Err(error)
+        }
+        None => {
+            crate::activity::current(|a| {
+                a.finish("reading_metadata", Some(&display));
+                a.resolve("reading_metadata", Some(&display), "checked");
+            });
+            Ok(unsafe { info.assume_init() })
+        }
     }
 }
 
@@ -64,13 +88,25 @@ pub struct DirectoryMaterialization {
 impl DirectoryMaterialization {
     pub fn begin() -> io::Result<Self> {
         #[cfg(target_os = "macos")]
+        let requested = materialization_policy::ON;
+        #[cfg(not(target_os = "macos"))]
+        let requested = 2;
+        Self::set(requested)
+    }
+    /// Deny implicit dataless-file materialization around entry access/mutation.
+    /// Narrow directory syscalls may temporarily override this and must restore it.
+    pub(crate) fn deny() -> io::Result<Self> {
+        Self::set(1)
+    }
+    fn set(_requested: i32) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
         let previous = {
-            use materialization_policy::{ON, THREAD, TYPE, getiopolicy_np, setiopolicy_np};
+            use materialization_policy::{THREAD, TYPE, getiopolicy_np, setiopolicy_np};
             let previous = unsafe { getiopolicy_np(TYPE, THREAD) };
             if previous < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if previous != ON && unsafe { setiopolicy_np(TYPE, THREAD, ON) } < 0 {
+            if previous != _requested && unsafe { setiopolicy_np(TYPE, THREAD, _requested) } < 0 {
                 return Err(io::Error::last_os_error());
             }
             previous
@@ -86,8 +122,8 @@ impl Drop for DirectoryMaterialization {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
         {
-            use materialization_policy::{ON, THREAD, TYPE, setiopolicy_np};
-            if self.previous != ON {
+            use materialization_policy::{THREAD, TYPE, setiopolicy_np};
+            {
                 // Restoring a value just read on this same thread uses the
                 // matching public API. Drop must also run during unwinding.
                 unsafe { setiopolicy_np(TYPE, THREAD, self.previous) };
@@ -478,6 +514,112 @@ pub(crate) mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn metadata_activity_captures_errno_and_resolves_only_a_successful_read() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("loop");
+        symlink("loop", &path).unwrap();
+        let activity = crate::activity::Activity::new();
+        let _binding = activity.bind();
+        let error = metadata(&path, true).unwrap_err();
+        let failed = activity.snapshot();
+        assert_eq!(failed["events"][0]["errno"], libc::ELOOP);
+        assert_eq!(failed["events"][0]["reason"], error.to_string());
+        activity.failed("observation", Some(path.to_str().unwrap()));
+        fs_remove_and_write(&path);
+        metadata(&path, true).unwrap();
+        let recovered = activity.snapshot();
+        assert_eq!(recovered["events"][0]["resolution"], "checked");
+        assert!(recovered["events"][1]["resolved_at"].is_null());
+    }
+
+    fn fs_remove_and_write(path: &std::path::Path) {
+        std::fs::remove_file(path).unwrap();
+        std::fs::write(path, b"owned fixture").unwrap();
+    }
+
+    #[test]
+    fn deleted_file_metadata_is_quiet_completed_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let activity = crate::activity::Activity::new();
+        let _binding = activity.bind();
+        for index in 0..32 {
+            let path = root.path().join(format!("rustc-{index}.tmp"));
+            std::fs::write(&path, b"temporary fixture").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            for follow in [false, true] {
+                assert_eq!(
+                    metadata(&path, follow).unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                );
+            }
+        }
+        let snapshot = activity.snapshot();
+        assert_eq!(snapshot["counters"]["errors"], 0);
+        assert!(snapshot["events"].as_array().unwrap().is_empty());
+        assert_eq!(snapshot["dropped_events"], 0);
+        assert_eq!(snapshot["counters"]["io_completed"], 64);
+        assert!(snapshot["last_progress_at"].is_number());
+        assert_eq!(snapshot["state"], "processing");
+        assert_eq!(
+            snapshot["item_path"],
+            root.path().join("rustc-31.tmp").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_keeps_permission_and_other_io_failures_visible() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let activity = crate::activity::Activity::new();
+        let _binding = activity.bind();
+        let looping = root.path().join("loop");
+        symlink("loop", &looping).unwrap();
+        assert_eq!(
+            metadata(&looping, true).unwrap_err().raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        let mut expected = 1;
+        // An effective root account bypasses ordinary directory permissions.
+        // The real I/O error above remains covered on privileged test hosts.
+        if unsafe { libc::geteuid() } != 0 {
+            let denied = root.path().join("denied");
+            std::fs::create_dir(&denied).unwrap();
+            let child = denied.join("file");
+            std::fs::write(&child, b"permission fixture").unwrap();
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o0)).unwrap();
+            let result = metadata(&child, false);
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            expected += 1;
+        }
+        let snapshot = activity.snapshot();
+        assert_eq!(snapshot["counters"]["errors"], expected);
+        let events = snapshot["events"].as_array().unwrap();
+        assert_eq!(events.len(), expected as usize);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["kind"] == "error" && event["phase"] == "reading_metadata")
+        );
+        assert_eq!(snapshot["counters"]["io_completed"], 0);
+    }
+
+    /// Model elapsed I/O time without making test success depend on scheduling.
+    /// Only the calling thread's active scope is advanced; other tests keep
+    /// their own deadlines and signal targets.
+    #[cfg(feature = "normalizer")]
+    pub(crate) fn elapse_inactivity(elapsed: Duration) {
+        let runtime = runtime().unwrap();
+        let mut state = runtime.lock();
+        let thread = unsafe { libc::pthread_self() } as usize;
+        let active = state.active.get_mut(&thread).expect("active fixture I/O");
+        active.deadline -= elapsed;
+        active.next_signal -= elapsed;
+        runtime.changed.notify_all();
+    }
 
     // A fallback writer bounds the fixture even when interruption is broken.
     // The assertion, rather than a hung test process, then reports the failure.

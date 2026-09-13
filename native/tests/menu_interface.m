@@ -39,20 +39,23 @@ static NSMenu *ZoomMenu(void) {
         if (FindAction(item.submenu, NSSelectorFromString(@"zoomIn:"))) return item.submenu;
     return nil;
 }
+static NSTimeInterval ActivationTimeout = 2;
 static BOOL ZoomKey(NSWindow *window, NSString *characters, NSEventModifierFlags modifiers, unsigned short keyCode) {
     // Activation and preceding window-close events arrive asynchronously. Wait
     // for the owned window to become key before testing its responder chain.
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:2];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:ActivationTimeout];
     do {
+        [NSRunningApplication.currentApplication activateWithOptions:NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps];
         [NSApp activateIgnoringOtherApps:YES];
         [window makeKeyAndOrderFront:nil];
         [window makeKeyWindow];
         NSDate *settle = [NSDate dateWithTimeIntervalSinceNow:.05];
         NSEvent *pending;
         while ((pending = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:settle inMode:NSDefaultRunLoopMode dequeue:YES])) [NSApp sendEvent:pending];
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.02]];
         if (NSApp.keyWindow == window) break;
     } while (deadline.timeIntervalSinceNow > 0);
-    Require(NSApp.keyWindow == window, @"The shortcut fixture window must be active");
+    Require(NSApp.keyWindow == window, [NSString stringWithFormat:@"The shortcut fixture window must be active (app=%d hidden=%d visible=%d eligible=%d key=%@ wanted=%@)", NSApp.active, NSApp.hidden, window.visible, window.canBecomeKeyWindow, NSApp.keyWindow, window]);
     NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:modifiers
         timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil
         characters:characters charactersIgnoringModifiers:characters isARepeat:NO keyCode:keyCode];
@@ -75,6 +78,11 @@ static BOOL ZoomKey(NSWindow *window, NSString *characters, NSEventModifierFlags
 @property NSDictionary *setupReplies;
 @end
 @implementation InterfaceMenuFixture
+- (void)requestWorkspace:(NSString *)request parameters:(NSDictionary *)parameters reply:(JasoWorkspaceReply)reply {
+    if ([request isEqual:@"activity"]) reply(@{@"activity":@{@"phase":@"idle"}, @"recent_events":@[], @"generation":@"fixture", @"available":@YES}, nil);
+    else if ([request isEqual:@"history"]) reply(@{@"records":@[], @"total":@0}, nil);
+    else reply(@{}, nil);
+}
 - (void)refresh { self.refreshCalls++; }
 - (void)run:(NSArray *)arguments { if (self.recordCommands) [self.commands addObject:arguments]; else [super run:arguments]; }
 - (void)languageChanged { self.languageChanges++; [super languageChanged]; }
@@ -112,11 +120,19 @@ static BOOL ZoomKey(NSWindow *window, NSString *characters, NSEventModifierFlags
 }
 @end
 
+@interface WorkspaceRequestFixture : JasoMenu
+@property NSMutableArray<NSArray<NSString *> *> *commands;
+@end
+@implementation WorkspaceRequestFixture
+- (NSDictionary *)execute:(NSArray<NSString *> *)arguments error:(NSString **)error { [self.commands addObject:arguments]; return @{@"ok":@YES}; }
+@end
+
 @interface StartupMenuFixture : JasoMenu
 @property NSDictionary *statusReply;
 @property NSDictionary *startupReply;
 @end
 @implementation StartupMenuFixture
+- (void)requestWorkspace:(NSString *)request parameters:(NSDictionary *)parameters reply:(JasoWorkspaceReply)reply { reply(@{@"records":@[], @"total":@0}, nil); }
 - (NSDictionary *)execute:(NSArray<NSString *> *)arguments error:(NSString **)error {
     if ([arguments.firstObject isEqual:@"status"]) return self.statusReply;
     if ([arguments isEqual:@[@"startup", @"status"]]) return self.startupReply;
@@ -153,6 +169,7 @@ static void Test(NSString *name, void (^body)(void)) {
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        if (argc > 1 && strcmp(argv[1], "--wait-for-activation") == 0) ActivationTimeout = 120;
         [NSApplication sharedApplication];
         [NSApp finishLaunching];
         NSApplicationActivationPolicy originalPolicy = NSApp.activationPolicy;
@@ -217,7 +234,7 @@ int main(int argc, const char **argv) {
                 NSDictionary *read = @{@"config":draft, @"revision":@"fixture-revision", @"running":@NO, @"paused":@YES};
                 menu.setupReplies = @{@"read":read, @"preview":@{@"entries":@1, @"candidates":@[], @"errors":@[], @"truncated":@NO, @"complete":@YES}, @"save":@{@"config":draft, @"revision":@"saved-revision", @"started":@YES, @"paused":@NO}};
                 [menu setup:nil]; WaitForMenuIdle(menu);
-                Require(menu.setupWindow.window.visible && [menu.setupWindow.revision isEqual:@"fixture-revision"], @"Setup did not load the saved configuration into the real window");
+                Require(menu.statusWindow.window.visible && !menu.setupWindow.window.visible && [menu.setupWindow.revision isEqual:@"fixture-revision"], @"Setup did not load the saved configuration into the real window");
                 menu.setupWindow.previewHandler(draft); WaitForMenuIdle(menu);
                 menu.setupWindow.saveHandler(draft, @"fixture-revision", YES); WaitForMenuIdle(menu);
                 Require(menu.commands.count == 3, @"The setup flow must read, preview, then save through its dedicated endpoint");
@@ -230,10 +247,30 @@ int main(int argc, const char **argv) {
                     }
                 }
                 Require([menu.commands.lastObject containsObject:@"--start"] && [menu.commands.lastObject containsObject:@"fixture-revision"], @"Starting cleanup must include explicit intent and the loaded revision");
-                [menu.setupWindow close];
-                Require(menu.setupWindow == nil, @"Closed setup must release its controller");
+                [menu.statusWindow close];
+                Require(menu.setupWindow != nil && !menu.statusWindow.window.visible, @"Closing the shared window must retain the folder draft for reopening");
             });
-            Test(@"reopening folder setup while preview cancels loads the new window", ^{
+            Test(@"workspace queries preserve literal arguments and the registered configuration", ^{
+                WorkspaceRequestFixture *menu = WorkspaceRequestFixture.new;
+                menu.configPath = @"/fixture/custom settings/config.json"; menu.commands = NSMutableArray.new;
+                NSString *query = @"보고서 ' $(touch never) --config";
+                NSArray *requests = @[
+                    @{@"name":@"history", @"parameters":@{@"search":query, @"offset":@12, @"limit":@24}, @"arguments":@[@"history",@"list",@"--search",query,@"--offset",@"12",@"--limit",@"24"]},
+                    @{@"name":@"activity", @"parameters":@{}, @"arguments":@[@"activity"]},
+                    @{@"name":@"storage", @"parameters":@{}, @"arguments":@[@"storage"]},
+                    @{@"name":@"history-preview", @"parameters":@{@"id":query,@"revision":@"revision"}, @"arguments":@[@"history",@"preview",@"--id",query,@"--revision",@"revision"]},
+                    @{@"name":@"history-restore", @"parameters":@{@"request_id":query,@"operation_id":@"operation",@"revision":@"revision"}, @"arguments":@[@"history",@"restore",@"--request-id",query,@"--operation-id",@"operation",@"--revision",@"revision"]},
+                    @{@"name":@"history-result", @"parameters":@{@"request_id":query}, @"arguments":@[@"history",@"result",@"--request-id",query]}
+                ];
+                for (NSDictionary *request in requests) {
+                    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+                    [menu requestWorkspace:request[@"name"] parameters:request[@"parameters"] reply:^(NSDictionary *result, NSString *error) { dispatch_semaphore_signal(finished); }];
+                    Require(dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0, @"The request must finish through the bounded command fixture");
+                    NSArray *expected = [request[@"arguments"] arrayByAddingObjectsFromArray:@[@"--config",menu.configPath]];
+                    Require([menu.commands.lastObject isEqual:expected], @"A workspace query must retain every literal argument and custom config path");
+                }
+            });
+            Test(@"reopening the shared window after preview cancellation preserves the folder draft", ^{
                 InterfaceMenuFixture *menu = [InterfaceMenuFixture new];
                 menu.configPath = @"/fixture/reopen/config.json";
                 menu.commands = [NSMutableArray array];
@@ -244,12 +281,12 @@ int main(int argc, const char **argv) {
                 menu.operationRelease = dispatch_semaphore_create(0);
                 menu.setupWindow.previewHandler(draft);
                 Require(dispatch_semaphore_wait(menu.operationStarted, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0, @"The preview command must be in progress before the close/reopen test");
-                [menu.setupWindow close];
+                [menu.statusWindow close];
                 [menu setup:nil];
                 dispatch_semaphore_signal(menu.operationRelease);
                 WaitForMenuIdle(menu);
-                Require([menu.setupWindow.revision isEqual:@"reopen-revision"], @"A reopened setup window must load after the cancelled preview finishes");
-                [menu.setupWindow close];
+                Require([menu.setupWindow.revision isEqual:@"reopen-revision"], @"Reopening the shared window must retain its loaded configuration after cancellation");
+                [menu.statusWindow close];
             });
             Test(@"cancelled preview releases controls only after its command finishes", ^{
                 InterfaceMenuFixture *menu = [InterfaceMenuFixture new];
@@ -258,10 +295,10 @@ int main(int argc, const char **argv) {
                 menu.setupReplies = @{@"read":@{@"config":draft, @"revision":@"cancel-revision", @"running":@NO, @"paused":@NO}, @"preview":@{@"entries":@0, @"candidates":@[], @"errors":@[], @"complete":@YES}};
                 [menu setup:nil]; WaitForMenuIdle(menu);
                 menu.operationStarted = dispatch_semaphore_create(0); menu.operationRelease = dispatch_semaphore_create(0);
-                NSButton *preview = (NSButton *)FindView(menu.setupWindow.window.contentView, @"setup-preview");
-                NSButton *cancel = (NSButton *)FindView(menu.setupWindow.window.contentView, @"setup-cancel");
-                NSButton *reload = (NSButton *)FindView(menu.setupWindow.window.contentView, @"setup-reload");
-                NSButton *save = (NSButton *)FindView(menu.setupWindow.window.contentView, @"setup-save");
+                NSButton *preview = (NSButton *)FindView(menu.statusWindow.window.contentView, @"setup-preview");
+                NSButton *cancel = (NSButton *)FindView(menu.statusWindow.window.contentView, @"setup-cancel");
+                NSButton *reload = (NSButton *)FindView(menu.statusWindow.window.contentView, @"setup-reload");
+                NSButton *save = (NSButton *)FindView(menu.statusWindow.window.contentView, @"setup-save");
                 [preview performClick:nil];
                 Require(dispatch_semaphore_wait(menu.operationStarted, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0, @"The preview fixture did not start");
                 [cancel performClick:nil];
@@ -271,13 +308,13 @@ int main(int argc, const char **argv) {
                 Require(reload.enabled && preview.enabled && save.enabled, @"Discarding a cancelled response must release the active window controls");
                 [reload performClick:nil]; WaitForMenuIdle(menu);
                 Require([menu.commands.lastObject[1] isEqual:@"read"] && reload.enabled, @"Reload after cancellation must finish without a stuck busy window");
-                [menu.setupWindow close];
+                [menu.statusWindow close];
             });
             Test(@"menu has a readable summary and one explicit status entry", ^{
                 [fixture.menu update];
                 NSMenuItem *summary = fixture.menu.itemArray.firstObject;
                 Require(summary.view != nil && summary.action == nil, @"Status must be readable content, not another status-window action");
-                Require(ContainsText(summary.view, @"Watching for changes"), @"Summary must show the current readable status");
+                Require(ContainsText(summary.view, @"Automatic cleanup is on"), @"Summary must show the current readable status");
                 NSUInteger links = 0;
                 for (NSMenuItem *item in fixture.menu.itemArray) {
                     if (item.action == @selector(details:)) links++;
@@ -304,11 +341,16 @@ int main(int argc, const char **argv) {
                 Require(fixture.pauseItem.hidden, @"Failed status must not present a stale primary command");
                 fixture.statusError = nil; fixture.snapshot = snapshot; [fixture updateMenuSnapshot];
                 [fixture details:nil];
-                for (NSString *action in @[@"restart", @"stop", @"reconcile"]) {
+                [fixture settings:nil];
+                [(NSButton *)FindView(fixture.statusWindow.window.contentView, @"settings-advanced-toggle") performClick:nil];
+                for (NSString *action in @[@"restart", @"reconcile"]) {
                     NSButton *button = (NSButton *)FindView(fixture.statusWindow.window.contentView, action);
+                    Require(button != nil && !button.hiddenOrHasHiddenAncestor, @"Maintenance must be available under Advanced settings");
                     [button performClick:nil];
-                    Require([fixture.commands.lastObject.firstObject isEqual:action], @"Status maintenance did not reach its worker command");
+                    Require([fixture.commands.lastObject.firstObject isEqual:action], @"Advanced maintenance did not reach its worker command");
                 }
+                [fixture stop:nil];
+                Require([fixture.commands.lastObject.firstObject isEqual:@"stop"], @"Stop must preserve the existing worker command");
                 [fixture.statusWindow close]; fixture.recordCommands = NO;
             });
 
@@ -322,11 +364,11 @@ int main(int argc, const char **argv) {
                 Require(ZoomKey(fixture.statusWindow.window, @"+", NSEventModifierFlagCommand | NSEventModifierFlagShift, 24), @"Command-plus did not dispatch");
                 Require(fabs([TestDefaults doubleForKey:@"contentZoom"] - 1.2) < .001, @"Command-plus must apply one zoom step");
                 [fixture settings:nil];
-                Require(ZoomKey(fixture.settingsWindow.window, @"-", NSEventModifierFlagCommand, 27), @"Command-minus did not dispatch to Settings");
+                Require(ZoomKey(fixture.statusWindow.window, @"-", NSEventModifierFlagCommand, 27), @"Command-minus did not dispatch to Settings");
                 Require(fabs([TestDefaults doubleForKey:@"contentZoom"] - 1.1) < .001, @"Command-minus must apply one step in Settings");
-                Require(ZoomKey(fixture.settingsWindow.window, @"0", NSEventModifierFlagCommand, 29), @"Command-zero did not dispatch");
+                Require(ZoomKey(fixture.statusWindow.window, @"0", NSEventModifierFlagCommand, 29), @"Command-zero did not dispatch");
                 Require(fabs([TestDefaults doubleForKey:@"contentZoom"] - 1) < .001, @"Command-zero must reset content zoom");
-                [fixture.statusWindow close]; [fixture.settingsWindow close];
+                [fixture.statusWindow close];
                 [viewMenu update];
                 Require(!FindAction(viewMenu, NSSelectorFromString(@"zoomIn:")).enabled, @"Zoom must be disabled with no owned active window");
             });
@@ -335,41 +377,51 @@ int main(int argc, const char **argv) {
                 fixture.permissionsRequests = [NSMutableArray array];
                 fixture.revealedPaths = [NSMutableArray array];
                 [fixture settings:nil];
+                NSButton *help = (NSButton *)FindView(fixture.statusWindow.window.contentView, @"settings-advanced-toggle");
+                if (![help.accessibilityValue boolValue]) [help performClick:nil];
                 NSArray *actions = @[@"login-items", @"full-disk-access", @"reveal-app"];
                 for (NSString *identifier in actions) {
-                    NSButton *button = (NSButton *)FindView(fixture.settingsWindow.window.contentView, identifier);
+                    NSButton *button = (NSButton *)FindView(fixture.statusWindow.window.contentView, identifier);
                     Require([button isKindOfClass:NSButton.class], @"A permissions action is absent from the real Settings window");
                     [button performClick:nil];
                 }
                 Require([fixture.permissionsRequests isEqual:@[@"login-items", @"reveal-app", @"full-disk-access", @"reveal-app"]], @"Full Disk Access must reveal the actual app before opening settings");
                 Require([fixture.revealedPaths isEqual:@[@"/Applications/Jaso NFC.app", @"/Applications/Jaso NFC.app"]], @"Permission actions must reveal the canonical Applications app");
-                [fixture.settingsWindow close];
+                [fixture.statusWindow close];
             });
 
-            Test(@"Settings language changes immediately translate the menu and open status window", ^{
-                [fixture details:nil];
-                Require([fixture.statusWindow.window.title isEqual:@"Jaso NFC · Cleanup status"], @"Status did not open in English");
-                Require(ContainsText(fixture.statusWindow.window.contentView, @"Watched locations"), @"The English status body is missing");
-                NSRect originalFrame = fixture.statusWindow.window.frame;
+            Test(@"Settings language changes translate the shared window and preserve navigation", ^{
+                fixture.snapshot = snapshot; [fixture details:nil];
+                [fixture.statusWindow selectSection:@"status"];
+                NSWindow *host = fixture.statusWindow.window;
+                Require([host.title isEqual:@"Jaso NFC"], @"The shared window must keep its stable product title");
+                Require(ContainsText(host.contentView, @"Automatic cleanup is on"), @"Status must use its stable primary heading");
+                NSRect originalFrame = host.frame;
                 [fixture settings:nil];
-                NSPopUpButton *picker = (NSPopUpButton *)FindView(fixture.settingsWindow.window.contentView, @"interface-language-picker");
-                Require(picker != nil, @"The real Settings window has no language picker");
+                Require(fixture.statusWindow.window == host && !fixture.settingsWindow.window.visible, @"Settings must use the same visible window");
+                NSPopUpButton *picker = (id)FindView(host.contentView, @"interface-language-picker");
+                Require(picker != nil, @"The embedded Settings view has no language picker");
                 [picker selectItemAtIndex:1];
-                Require([picker.selectedItem.representedObject isEqual:@"ko"], @"The Korean option has an incorrect language value");
-                Require([NSApp sendAction:picker.action to:picker.target from:picker], @"The Settings picker action was not dispatched");
-                Require(fixture.languageChanges == 1, @"Settings did not invoke the menu's languageChanged callback");
-                Require([FindAction(fixture.menu, @selector(settings:)).title isEqual:@"설정…"], @"The menu Settings action did not translate");
-                Require(ContainsText(fixture.menu.itemArray.firstObject.view, @"변경 사항 감지 중"), @"The menu summary did not translate");
-                Require(fixture.statusWindow.window.visible && [fixture.statusWindow.window.title isEqual:@"Jaso NFC · 파일명 정리 상태"], @"The already-open status window did not translate");
-                Require(ContainsText(fixture.statusWindow.window.contentView, @"감시 위치"), @"The open status body did not translate");
-                Require(NSEqualRects(fixture.statusWindow.window.frame, originalFrame), @"Language change moved or resized the status window");
-                Require([fixture.settingsWindow.window.title isEqual:@"Jaso NFC · 설정"], @"Settings did not remain localized after rebuilding the menu");
-                NSMenu *applicationMenu = [NSApp.mainMenu itemAtIndex:0].submenu;
-                Require([FindAction(applicationMenu, @selector(settings:)).title isEqual:@"설정…"] && [FindAction(applicationMenu, @selector(about:)).title isEqual:@"Jaso NFC 정보"], @"The native application menu did not translate");
-                Require([FindAction(applicationMenu, @selector(hide:)).title isEqual:@"Jaso NFC 가리기"] && [FindAction(applicationMenu, @selector(unhideAllApplications:)).title isEqual:@"모두 보기"], @"Standard application commands did not translate");
-                Require([NSApp.windowsMenu.title isEqual:@"창"] && [FindAction(NSApp.windowsMenu, @selector(performClose:)).title isEqual:@"닫기"], @"The native Window menu did not translate");
-                Require([ZoomMenu().title isEqual:@"보기"] && [FindAction(ZoomMenu(), NSSelectorFromString(@"zoomIn:")).title isEqual:@"확대"] && [FindAction(ZoomMenu(), NSSelectorFromString(@"resetZoom:")).title isEqual:@"실제 크기"], @"The View content zoom commands did not translate");
-                Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Relocalizing an open window lost the application's menu bar");
+                Require([picker.selectedItem.representedObject isEqual:@"ko"], @"The Korean option has an incorrect value");
+                Require([NSApp sendAction:picker.action to:picker.target from:picker], @"Language selection was not dispatched");
+                Require(fixture.languageChanges == 1, @"Language changes must reach the menu once");
+                Require([FindAction(fixture.menu, @selector(settings:)).title isEqual:@"설정…"], @"The menu did not translate");
+                NSArray *sections = @[@"status", @"activity", @"folders", @"history", @"settings"];
+                NSArray *names = @[@"상태", @"활동", @"폴더", @"변경 기록", @"설정"];
+                for (NSUInteger i = 0; i < sections.count; i++) {
+                    NSButton *nav = (id)FindView(host.contentView, [@"nav-" stringByAppendingString:sections[i]]);
+                    Require([nav.title isEqual:names[i]], @"Every navigation section must translate");
+                }
+                Require([fixture.statusWindow.selectedSection isEqual:@"settings"] && ContainsText(host.contentView,@"언어"), @"Changing language must retain the current page and localize its controls");
+                [(NSButton *)FindView(host.contentView, @"nav-status") performClick:nil];
+                Require(ContainsText(host.contentView, @"자동 정리가 켜져 있습니다"), @"The shared Status heading must translate on return");
+                Require(NSEqualRects(host.frame, originalFrame), @"Language changes must preserve the window frame");
+                NSMenu *application = [NSApp.mainMenu itemAtIndex:0].submenu;
+                Require([FindAction(application, @selector(settings:)).title isEqual:@"설정…"] && [FindAction(application, @selector(about:)).title isEqual:@"Jaso NFC 정보"], @"Application commands must translate");
+                Require([FindAction(application, @selector(hide:)).title isEqual:@"Jaso NFC 가리기"] && [FindAction(application, @selector(unhideAllApplications:)).title isEqual:@"모두 보기"], @"Standard commands must translate");
+                Require([NSApp.windowsMenu.title isEqual:@"창"] && [FindAction(NSApp.windowsMenu, @selector(performClose:)).title isEqual:@"닫기"], @"Window commands must translate");
+                Require([ZoomMenu().title isEqual:@"보기"] && [FindAction(ZoomMenu(), NSSelectorFromString(@"zoomIn:")).title isEqual:@"확대"] && [FindAction(ZoomMenu(), NSSelectorFromString(@"resetZoom:")).title isEqual:@"실제 크기"], @"View commands must translate");
+                Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Localization must preserve the application's menu");
             });
 
             Test(@"saved Korean language survives rebuilding the menu", ^{
@@ -396,33 +448,34 @@ int main(int argc, const char **argv) {
                 [fixture updateMenuSnapshot];
             });
 
-            Test(@"closing both windows clears their menu ownership", ^{
-                [fixture.statusWindow close];
-                [fixture.settingsWindow close];
-                Require(fixture.statusWindow == nil && fixture.settingsWindow == nil, @"A closed window remains owned by the menu");
-                Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Closing both windows did not retain regular app visibility");
-                Require(fixture.refreshCalls >= 2 && !fixture.busy, @"The test did not exercise the stubbed refresh path");
+            Test(@"closing the shared window retains navigation and stops automatic view refresh", ^{
+                [fixture settings:nil];
+                JasoWorkspaceWindowController *workspace = fixture.statusWindow;
+                JasoSettingsWindowController *settings = fixture.settingsWindow;
+                [workspace close];
+                Require(fixture.statusWindow == workspace && fixture.settingsWindow == settings && !workspace.window.visible, @"A closed shared window retains navigation and embedded controllers");
+                Require(!workspace.refreshingAutomatically, @"Closing the shared window must stop its automatic activity refresh");
+                Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Closing the shared window must retain application visibility");
+                Require(fixture.refreshCalls >= 2 && !fixture.busy, @"The test must exercise the bounded refresh path");
             });
-            Test(@"either open window retains the application menu until the last window closes", ^{
+            Test(@"Settings and Status use one retained window and menu item", ^{
                 NSStatusItem *ownedItem = fixture.statusItem;
+                JasoWorkspaceWindowController *workspace = fixture.statusWindow;
                 [fixture settings:nil];
-                Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Settings alone did not enable the application's menu bar");
-                [fixture details:nil];
-                [fixture.settingsWindow close];
-                Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular && fixture.statusWindow.window.visible, @"Closing Settings hid the menu while status remained open");
-                [fixture settings:nil];
-                [fixture.statusWindow close];
-                Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular && fixture.settingsWindow.window.visible, @"Closing status hid the menu while Settings remained open");
-                [fixture.settingsWindow close];
-                Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Closing the final Settings window did not retain regular app visibility");
-                Require(fixture.statusItem == ownedItem, @"Switching activation policy replaced the menu bar status item");
+                Require(workspace.window.visible && [workspace.selectedSection isEqual:@"settings"], @"Settings must reopen its shared window");
+                [(NSButton *)FindView(workspace.window.contentView,@"nav-status") performClick:nil];
+                Require([workspace.selectedSection isEqual:@"status"] && !fixture.settingsWindow.window.visible, @"Navigation must switch the shared content without another window");
+                [workspace close]; [fixture details:nil];
+                Require(fixture.statusWindow == workspace && workspace.window.visible && [workspace.selectedSection isEqual:@"status"], @"Reopening must retain the last section");
+                Require(fixture.statusItem == ownedItem && NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Navigation must retain the native menu and status item");
+                [workspace close];
             });
             Test(@"Finder reopen and status-only language changes retain regular activation", ^{
                 Require([fixture applicationShouldHandleReopen:NSApp hasVisibleWindows:NO], @"Finder reopen was rejected");
                 Require(fixture.statusWindow.window.visible && NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Finder reopen did not open the status window with the application menu");
                 JasoSetLanguagePreference(@"en");
                 [fixture languageChanged];
-                Require(fixture.statusWindow.window.visible && [fixture.statusWindow.window.title isEqual:@"Jaso NFC · Cleanup status"] && NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Status-only relocalization lost the window or application menu");
+                Require(fixture.statusWindow.window.visible && [fixture.statusWindow.window.title isEqual:@"Jaso NFC"] && NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Status-only relocalization lost the window or application menu");
                 [fixture.statusWindow close];
                 Require(NSApp.activationPolicy == NSApplicationActivationPolicyRegular, @"Closing the reopened window did not retain regular app visibility");
             });
@@ -482,7 +535,7 @@ int main(int argc, const char **argv) {
             fprintf(stderr, "FAIL fixture setup: %s\n", error.reason.UTF8String);
         } @finally {
             [fixture.statusWindow close];
-            [fixture.settingsWindow close];
+            [fixture.statusWindow close];
             fixture.mark.animationEnabled = NO;
             if (fixture.statusItem) [NSStatusBar.systemStatusBar removeStatusItem:fixture.statusItem];
             fixture.statusItem = nil;

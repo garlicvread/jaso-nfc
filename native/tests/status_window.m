@@ -1,4 +1,5 @@
 #import "../macos/StatusWindow.h"
+#import "../macos/ContentZoom.h"
 
 static void Require(BOOL value, NSString *message) {
     if (!value) @throw [NSException exceptionWithName:@"TestFailure" reason:message userInfo:nil];
@@ -17,6 +18,18 @@ static NSArray *Views(NSView *view, NSString *identifier) {
     IdentifiedViews(view, identifier, matches);
     return matches;
 }
+static void ViewOrder(NSView *view, NSMutableArray *views) {
+    [views addObject:view];
+    for (NSView *child in view.subviews) ViewOrder(child, views);
+}
+static void RequireReadableText(NSView *view) {
+    if ([view isKindOfClass:NSTextField.class]) {
+        NSTextField *field = (NSTextField *)view;
+        NSSize needed = [field.cell cellSizeForBounds:NSMakeRect(0, 0, field.bounds.size.width, CGFLOAT_MAX)];
+        Require(field.bounds.size.width > 0 && needed.height <= field.bounds.size.height + 1, @"Automatic retry cause, path, or next step is clipped at minimum width and chosen zoom");
+    }
+    for (NSView *child in view.subviews) RequireReadableText(child);
+}
 static void Render(JasoStatusWindowController *controller, NSString *path) {
     [controller.window.contentView layoutSubtreeIfNeeded];
     NSView *view = controller.window.contentView;
@@ -24,6 +37,15 @@ static void Render(JasoStatusWindowController *controller, NSString *path) {
     [view cacheDisplayInRect:view.bounds toBitmapImageRep:bitmap];
     NSData *data = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
     Require(data.length > 1000 && [data writeToFile:path atomically:YES], @"Could not render the production status view");
+}
+static void RenderAtView(JasoStatusWindowController *controller, NSView *target, NSString *path) {
+    [controller.window.contentView layoutSubtreeIfNeeded];
+    NSView *group = target.superview;
+    Require([group.identifier isEqual:@"automatic-retry-group"], @"The automatic retry disclosure must belong to its detail group");
+    NSBitmapImageRep *bitmap = [group bitmapImageRepForCachingDisplayInRect:group.bounds];
+    [group cacheDisplayInRect:group.bounds toBitmapImageRep:bitmap];
+    NSData *data = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    Require(data.length > 1000 && [data writeToFile:path atomically:YES], @"Could not render the complete automatic retry group");
 }
 int main(int argc, const char **argv) {
     @autoreleasepool {
@@ -86,6 +108,14 @@ int main(int argc, const char **argv) {
                     Require([visible containsString:@"128,450"], @"Indexed count is missing from the actual window");
                     Require(!controller.refreshingAutomatically, @"A never-opened window must not poll");
                     if ([fixture[@"name"] isEqual:@"file-actions"]) {
+                        Require([visible containsString:renamePath] && ![visible containsString:directoryPath], @"Actionable files must remain visible while automatic retry details start collapsed");
+                        NSArray *disclosures = Views(controller.window.contentView, @"automatic-retry-disclosure");
+                        Require(disclosures.count == 1 && [(NSButton *)disclosures.firstObject state] == NSControlStateValueOff, @"Automatic retry needs one collapsed disclosure");
+                        NSArray *actionSummaries = Views(controller.window.contentView, @"action-issue-summary");
+                        Require(actionSummaries.count == 1 && [(NSTextField *)actionSummaries.firstObject stringValue].length > 0, @"Actionable items must explain their next step separately");
+                        [(NSButton *)disclosures.firstObject performClick:nil];
+                        texts = [NSMutableArray array]; Texts(controller.window.contentView, texts);
+                        visible = [texts componentsJoinedByString:@"\n"];
                         Require([visible containsString:renamePath] && [visible containsString:directoryPath], @"Affected files and folders are absent from the status view");
                         Require([texts containsObject:renamePath.lastPathComponent] && [texts containsObject:directoryPath.lastPathComponent], @"Issue cards must identify the affected filenames separately from their full paths");
                         NSArray *paths = Views(controller.window.contentView, @"issue-path");
@@ -95,8 +125,8 @@ int main(int argc, const char **argv) {
                             NSSize needed = [path.cell cellSizeForBounds:NSMakeRect(0, 0, path.bounds.size.width, CGFLOAT_MAX)];
                             Require(needed.height <= path.bounds.size.height + 1, @"A long affected path is clipped");
                         }
-                        NSArray *summaries = Views(controller.window.contentView, @"issue-summary");
-                        Require(summaries.count == 1 && [(NSTextField *)summaries.firstObject stringValue].length > 0, @"The issue section does not explain the next step");
+                        NSArray *summaries = Views(controller.window.contentView, @"automatic-retry-detail");
+                        Require(summaries.count == 1 && [(NSTextField *)summaries.firstObject stringValue].length > 0, @"Expanded automatic retry must explain its next attempt separately");
                         NSMutableArray *revealed = [NSMutableArray array];
                         controller.pathHandler = ^(NSString *path) { [revealed addObject:path]; };
                         NSArray *buttons = Views(controller.window.contentView, @"issue-reveal");
@@ -109,6 +139,7 @@ int main(int argc, const char **argv) {
                         NSUInteger pathIndex = [texts indexOfObject:renamePath];
                         NSUInteger locationsIndex = [texts indexOfObject:[language isEqual:@"ko"] ? @"감시 위치" : @"Watched locations"];
                         Require(pathIndex < locationsIndex, @"Actionable issues appear after the generic location list");
+                        Require([texts indexOfObject:directoryPath] > locationsIndex, @"Automatic retry details must follow watched locations");
                     }
                     if ([fixture[@"name"] isEqual:@"provider-actions"]) {
                         BOOL korean = [language isEqual:@"ko"];
@@ -159,6 +190,61 @@ int main(int argc, const char **argv) {
                 }
             }
             }
+            NSMutableDictionary *automatic = watching.mutableCopy;
+            automatic[@"pending_jobs"] = @1;
+            automatic[@"directory_retry_count"] = @1;
+            automatic[@"next_retry"] = futureRetry;
+            automatic[@"directory_retry_items"] = @[@{@"path":directoryPath, @"reason":@"11", @"attempts":@2, @"next_retry":futureRetry}];
+            for (NSString *language in @[@"en", @"ko"]) {
+                for (NSNumber *zoom in @[@1, @2]) {
+                    [NSUserDefaults.standardUserDefaults setVolatileDomain:@{@"interfaceLanguage":language, @"contentZoom":zoom} forName:NSArgumentDomain];
+                    JasoStatusWindowController *automaticController = [JasoStatusWindowController new];
+                    NSRect frame = automaticController.window.frame;
+                    frame.size.width = automaticController.window.minSize.width;
+                    [automaticController.window setFrame:frame display:NO];
+                    [automaticController updateSnapshot:automatic error:nil updatedAt:NSDate.date];
+                    NSArray *disclosures = Views(automaticController.window.contentView, @"automatic-retry-disclosure");
+                    Require(disclosures.count == 1 && Views(automaticController.window.contentView, @"issue-path").count == 0, @"Automatic retry must start as one compact disclosure without file cards");
+                    NSButton *disclosure = disclosures.firstObject;
+                    Require(disclosure.state == NSControlStateValueOff && [disclosure.title containsString:[language isEqual:@"ko"] ? @"자동 재시도" : @"Automatic retries"], @"Automatic retry disclosure must be localized and start closed");
+                    Require(Views(automaticController.window.contentView, @"action-issue-summary").count == 0, @"Automatic retry must not create an action-required summary");
+                    NSSize needed = [disclosure.cell cellSizeForBounds:NSMakeRect(0, 0, disclosure.bounds.size.width, CGFLOAT_MAX)];
+                    Require(disclosure.bounds.size.width > 0 && needed.height <= disclosure.bounds.size.height + 1, @"The compact retry control is clipped at minimum width and chosen zoom");
+                    NSMutableArray *ordered = [NSMutableArray array]; ViewOrder(automaticController.window.contentView, ordered);
+                    NSUInteger locationIndex = NSNotFound;
+                    for (NSView *view in ordered) if ([view isKindOfClass:NSTextField.class] && [[(NSTextField *)view stringValue] isEqual:[language isEqual:@"ko"] ? @"감시 위치" : @"Watched locations"]) locationIndex = [ordered indexOfObject:view];
+                    Require(locationIndex != NSNotFound && locationIndex < [ordered indexOfObject:disclosure], @"Automatic retry disclosure must follow normal watched locations");
+                    if (output) Render(automaticController, [output stringByAppendingPathComponent:[NSString stringWithFormat:@"automatic-%@-%.1f-window.png", language, zoom.doubleValue]]);
+                    if (output) RenderAtView(automaticController, disclosure, [output stringByAppendingPathComponent:[NSString stringWithFormat:@"automatic-%@-%.1f-collapsed.png", language, zoom.doubleValue]]);
+                    Require([automaticController.window makeFirstResponder:disclosure] && automaticController.window.firstResponder == disclosure, @"The automatic retry disclosure must accept keyboard focus");
+                    [disclosure performClick:nil];
+                    Require(Views(automaticController.window.contentView, @"issue-path").count == 1, @"Opening automatic retry must reveal its affected item");
+                    Require(automaticController.window.firstResponder == Views(automaticController.window.contentView, @"automatic-retry-disclosure").firstObject, @"Opening retry details must retain keyboard focus on the replacement disclosure");
+                    __block NSString *revealedPath = nil;
+                    automaticController.pathHandler = ^(NSString *path) { revealedPath = path; };
+                    [(NSButton *)Views(automaticController.window.contentView, @"issue-reveal").firstObject performClick:nil];
+                    Require([revealedPath isEqual:directoryPath], @"Expanded automatic retry must retain the exact Finder path");
+                    [automaticController updateSnapshot:automatic error:nil updatedAt:NSDate.date];
+                    Require([(NSButton *)Views(automaticController.window.contentView, @"automatic-retry-disclosure").firstObject state] == NSControlStateValueOn && Views(automaticController.window.contentView, @"issue-path").count == 1, @"Automatic refresh must preserve expanded retry details");
+                    Require(automaticController.window.firstResponder == Views(automaticController.window.contentView, @"automatic-retry-disclosure").firstObject, @"Automatic refresh must retain disclosure keyboard focus");
+                    RequireReadableText(Views(automaticController.window.contentView, @"automatic-retry-group").firstObject);
+                    if (output) RenderAtView(automaticController, Views(automaticController.window.contentView, @"automatic-retry-disclosure").firstObject, [output stringByAppendingPathComponent:[NSString stringWithFormat:@"automatic-%@-%.1f-expanded.png", language, zoom.doubleValue]]);
+                    NSString *otherLanguage = [language isEqual:@"ko"] ? @"en" : @"ko";
+                    [NSUserDefaults.standardUserDefaults setVolatileDomain:@{@"interfaceLanguage":otherLanguage, @"contentZoom":@1.5} forName:NSArgumentDomain];
+                    [NSNotificationCenter.defaultCenter postNotificationName:JasoContentZoomDidChangeNotification object:nil];
+                    NSButton *refreshed = Views(automaticController.window.contentView, @"automatic-retry-disclosure").firstObject;
+                    Require(refreshed.state == NSControlStateValueOn && [refreshed.title containsString:[otherLanguage isEqual:@"ko"] ? @"자동 재시도" : @"Automatic retries"] && Views(automaticController.window.contentView, @"issue-path").count == 1, @"Language and zoom redraw must preserve expansion and update its label");
+                    [refreshed performClick:nil];
+                    Require(Views(automaticController.window.contentView, @"issue-path").count == 0, @"Closing the disclosure must remove automatic file cards");
+                    Require(automaticController.window.firstResponder == Views(automaticController.window.contentView, @"automatic-retry-disclosure").firstObject, @"Closing retry details must retain keyboard focus on the replacement disclosure");
+                    [automaticController updateSnapshot:automatic error:nil updatedAt:NSDate.date];
+                    Require([(NSButton *)Views(automaticController.window.contentView, @"automatic-retry-disclosure").firstObject state] == NSControlStateValueOff, @"Refresh must preserve a user's closed disclosure");
+                    [automaticController updateSnapshot:watching error:nil updatedAt:NSDate.date];
+                    Require(Views(automaticController.window.contentView, @"automatic-retry-disclosure").count == 0, @"Completed retries must remove the disclosure");
+                    [automaticController close]; passed++;
+                }
+            }
+            [NSUserDefaults.standardUserDefaults setVolatileDomain:@{@"interfaceLanguage":@"en", @"contentZoom":@1} forName:NSArgumentDomain];
             NSMutableDictionary *invalidPaths = watching.mutableCopy;
             invalidPaths[@"deferred_renames"] = @2;
             invalidPaths[@"rename_retry_items"] = @[@{@"path":@"relative/file.txt", @"reason":@"13", @"attempts":@1, @"next_retry":futureRetry, @"locked":@NO},

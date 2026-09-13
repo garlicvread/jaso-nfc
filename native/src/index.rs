@@ -3,6 +3,7 @@
 //! Event consequences and cursors commit together. A separate worker mutex
 //! serializes observations, while the SQLite mutex is released for every scan.
 //! Recursive work advances through a durable frontier one directory at a time.
+use crate::filename_repair::filename_target;
 use anyhow::{Context, Result, bail};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
@@ -14,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use unicode_normalization::is_nfc;
 
 use crate::model::{
     Entry, Event, PendingRecoveryError, Reconciler, ScanError, ScanResult, Volume, now,
@@ -36,6 +36,8 @@ const MAX_JOBS: i64 = 4096;
 const ORDINARY_BURST_LIMIT: u32 = 256;
 const ORDINARY_BURST_TIME: Duration = Duration::from_secs(1);
 const QUEUE_ROWID_HIGH_WATER: &str = "queue_rowid_high_water";
+const FILENAME_POLICY_REVISION: u32 = 1;
+const FILENAME_POLICY_PENDING_ROOTS: &str = "filename_policy_pending_roots";
 
 fn scheduling_now() -> Instant {
     #[cfg(test)]
@@ -55,6 +57,178 @@ fn parent(path: &str) -> String {
         .unwrap_or(Path::new("/"))
         .to_string_lossy()
         .into_owned()
+}
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or("")
+}
+
+// A directory prefix belongs in one row, rather than in every observation and
+// both of its indexes. Keep the historical read interface for status tools and
+// old read-only clients; worker lookups use the compact composite key directly.
+fn initialize_entry_storage(db: &Connection) -> Result<()> {
+    let kind: Option<String> = db
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='entries'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if kind.as_deref() == Some("view") {
+        let revision: Option<String> = db
+            .query_row(
+                "SELECT value FROM meta WHERE key='entry_storage_revision'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if revision.as_deref() != Some("1") {
+            bail!("Unsupported entry storage revision");
+        }
+        return Ok(());
+    }
+    if kind.is_some() && kind.as_deref() != Some("table") {
+        bail!("Unsupported entries schema");
+    }
+    db.execute_batch(
+        "CREATE TABLE entry_parents (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+         CREATE TABLE entry_data (
+            parent_id INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
+            dev INTEGER, ino INTEGER, mtime_ns INTEGER, ctime_ns INTEGER,
+            size INTEGER, mode INTEGER, PRIMARY KEY(parent_id,name)
+         ) WITHOUT ROWID;",
+    )?;
+    if kind.is_some() {
+        // Reject non-reconstructable legacy rows before replacing anything. All
+        // operations run inside the caller's schema transaction, so failure or
+        // interruption leaves the old observations and work state intact.
+        let invalid: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE path IS NULL OR substr(parent,1,1)!='/' OR
+             substr(path,1,length(parent)+CASE WHEN parent='/' THEN 0 ELSE 1 END) !=
+                parent||CASE WHEN parent='/' THEN '' ELSE '/' END OR
+             length(substr(path,length(parent)+CASE WHEN parent='/' THEN 1 ELSE 2 END))=0 OR
+             instr(substr(path,length(parent)+CASE WHEN parent='/' THEN 1 ELSE 2 END),'/')>0)",
+            [],
+            |r| r.get(0),
+        )?;
+        if invalid {
+            bail!("Legacy entry path cannot be reconstructed without changing its spelling");
+        }
+        db.execute_batch(
+            "INSERT INTO entry_parents(path) SELECT DISTINCT parent FROM entries ORDER BY parent;
+             INSERT INTO entry_data
+                SELECT p.id, substr(e.path,length(e.parent)+CASE WHEN e.parent='/' THEN 1 ELSE 2 END),
+                    e.kind,e.dev,e.ino,e.mtime_ns,e.ctime_ns,e.size,e.mode
+                FROM entries e JOIN entry_parents p ON p.path=e.parent;",
+        )?;
+        let complete: bool = db.query_row(
+            "SELECT (SELECT count(*) FROM entries)=(SELECT count(*) FROM entry_data)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !complete {
+            bail!("Entry storage migration did not preserve every observation");
+        }
+        db.execute_batch(
+            "DROP TABLE entries;
+             INSERT INTO meta(key,value) VALUES ('entry_storage_compaction_pending','true');",
+        )?;
+    }
+    db.execute_batch(
+        "CREATE VIEW entries AS
+            SELECT p.path||CASE WHEN p.path='/' THEN '' ELSE '/' END||e.name AS path,
+                p.path AS parent,e.kind,e.dev,e.ino,e.mtime_ns,e.ctime_ns,e.size,e.mode
+            FROM entry_data e JOIN entry_parents p ON p.id=e.parent_id;
+         INSERT INTO meta(key,value) VALUES ('entry_storage_revision','1');",
+    )?;
+    Ok(())
+}
+
+fn compact_migrated_storage(db: &Connection) -> Result<()> {
+    let pending: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='entry_storage_compaction_pending')",
+        [],
+        |r| r.get(0),
+    )?;
+    if pending {
+        // VACUUM cannot share the migration transaction. Retain the marker on
+        // failure so the next writable open retries only page reclamation.
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        db.execute(
+            "DELETE FROM meta WHERE key='entry_storage_compaction_pending'",
+            [],
+        )?;
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    }
+    Ok(())
+}
+
+/// Restore the previous worker's writable entry schema before restarting that
+/// worker during installation rollback. The caller must hold the runtime lock.
+/// Entry observations and all queued work remain in this database; no separate
+/// copy or baseline rebuild is needed. A failed conversion rolls back in full.
+pub fn restore_legacy_storage(path: impl AsRef<Path>) -> Result<bool> {
+    let path = path.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            bail!("Index recovery requires a regular database file");
+        }
+        Ok(_) => {}
+    }
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    db.busy_timeout(Duration::from_secs(10))?;
+    db.execute_batch("PRAGMA synchronous=FULL;")?;
+    let transaction = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
+    let kind: Option<String> = transaction
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='entries'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if kind.is_none() || kind.as_deref() == Some("table") {
+        return Ok(false);
+    }
+    let revision: Option<String> = transaction
+        .query_row(
+            "SELECT value FROM meta WHERE key='entry_storage_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if kind.as_deref() != Some("view") || revision.as_deref() != Some("1") {
+        bail!("Unsupported entry storage revision for legacy recovery");
+    }
+    transaction.execute_batch(
+        "CREATE TABLE entries_legacy_recovery (
+            path TEXT PRIMARY KEY, parent TEXT NOT NULL, kind TEXT NOT NULL,
+            dev INTEGER, ino INTEGER, mtime_ns INTEGER, ctime_ns INTEGER,
+            size INTEGER, mode INTEGER);
+         INSERT INTO entries_legacy_recovery
+            SELECT path,parent,kind,dev,ino,mtime_ns,ctime_ns,size,mode FROM entries;",
+    )?;
+    let complete: bool = transaction.query_row(
+        "SELECT (SELECT count(*) FROM entry_data)=(SELECT count(*) FROM entries_legacy_recovery)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !complete {
+        bail!("Legacy index recovery did not preserve every observation");
+    }
+    transaction.execute_batch(
+        "DROP VIEW entries;
+         DROP TABLE entry_data;
+         DROP TABLE entry_parents;
+         ALTER TABLE entries_legacy_recovery RENAME TO entries;
+         CREATE INDEX entries_parent ON entries(parent);
+         DELETE FROM meta WHERE key IN ('entry_storage_revision','entry_storage_compaction_pending');",
+    )?;
+    transaction.commit()?;
+    Ok(true)
 }
 fn sqlite_unsigned(value: u64) -> SqlValue {
     if value <= i64::MAX as u64 {
@@ -115,8 +289,16 @@ struct State {
     policy: Option<Policy>,
     active_job: Option<Job>,
     next_ready_class: i64,
-    ordinary_burst: Option<(Instant, u32)>,
+    ready_burst: Option<(i64, Instant, u32)>,
     startup_rowid: i64,
+}
+
+#[derive(Default)]
+struct ConfigureSourcesOptions<'a> {
+    preserve_unavailable: bool,
+    policy: Option<Policy>,
+    running: Option<&'a BTreeSet<String>>,
+    config: Option<&'a crate::config::Config>,
 }
 
 pub struct Index {
@@ -167,11 +349,6 @@ impl Index {
                 CREATE TABLE IF NOT EXISTS deferred_jobs (
                     path TEXT PRIMARY KEY, volume_key TEXT NOT NULL,
                     recursive INTEGER NOT NULL, baseline INTEGER NOT NULL DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS entries (
-                    path TEXT PRIMARY KEY, parent TEXT NOT NULL, kind TEXT NOT NULL,
-                    dev INTEGER, ino INTEGER, mtime_ns INTEGER, ctime_ns INTEGER,
-                    size INTEGER, mode INTEGER);
-                CREATE INDEX IF NOT EXISTS entries_parent ON entries(parent);
                 CREATE TABLE IF NOT EXISTS directories (path TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS metrics (key TEXT PRIMARY KEY, value INTEGER NOT NULL);",
             )?;
@@ -187,14 +364,16 @@ impl Index {
                     [],
                 )?;
             }
+            initialize_entry_storage(&transaction)?;
             transaction.commit()?;
+            compact_migrated_storage(&db)?;
         }
         let mut state = State {
             db,
             policy: None,
             active_job: None,
             next_ready_class: 0,
-            ordinary_burst: None,
+            ready_burst: None,
             startup_rowid: 0,
         };
         if !read_only {
@@ -242,11 +421,33 @@ impl Index {
             .map_err(|_| anyhow::anyhow!("Index worker mutex poisoned"))
     }
     pub fn bind_policy(&self, policy: Policy) -> Result<()> {
-        self.lock()?.policy = Some(policy);
+        let _worker = self.lock_worker()?;
+        let mut state = self.lock()?;
+        if !self.read_only {
+            let transaction =
+                Transaction::new_unchecked(&state.db, TransactionBehavior::Immediate)?;
+            // Binding executable coverage is not an authoritative removal of
+            // saved roots. CLI reconciliation can omit an unavailable selection.
+            let mut saved_policy = policy.clone();
+            saved_policy
+                .roots
+                .extend(state.get::<Vec<String>>("roots", vec![])?);
+            saved_policy.roots.sort();
+            saved_policy.roots.dedup();
+            state.reconcile_hidden_directories(&saved_policy)?;
+            state.refresh_baseline()?;
+            transaction.commit()?;
+        }
+        state.policy = Some(policy);
         Ok(())
     }
     pub fn configure(&self, signature: &str, volumes: &[Volume], roots: &[String]) -> Result<bool> {
-        self.configure_sources(signature, volumes, roots, false, None, None)
+        self.configure_sources(
+            signature,
+            volumes,
+            roots,
+            ConfigureSourcesOptions::default(),
+        )
     }
     /// Availability is not deletion. Retain a known desired root's identity,
     /// cursor and frontier while its stream cannot currently be started.
@@ -256,7 +457,15 @@ impl Index {
         volumes: &[Volume],
         desired: &[String],
     ) -> Result<bool> {
-        self.configure_sources(signature, volumes, desired, true, None, None)
+        self.configure_sources(
+            signature,
+            volumes,
+            desired,
+            ConfigureSourcesOptions {
+                preserve_unavailable: true,
+                ..Default::default()
+            },
+        )
     }
     pub fn configure_policy(
         &self,
@@ -265,23 +474,35 @@ impl Index {
         desired: &[String],
         policy: Policy,
     ) -> Result<bool> {
-        self.configure_sources(signature, volumes, desired, true, Some(policy), None)
+        self.configure_sources(
+            signature,
+            volumes,
+            desired,
+            ConfigureSourcesOptions {
+                preserve_unavailable: true,
+                policy: Some(policy),
+                ..Default::default()
+            },
+        )
     }
     pub fn prepare_sources(
         &self,
-        signature: &str,
+        config: &crate::config::Config,
         volumes: &[Volume],
         desired: &[String],
         policy: Policy,
         running: &BTreeSet<String>,
     ) -> Result<bool> {
         self.configure_sources(
-            signature,
+            &config.signature(),
             volumes,
             desired,
-            true,
-            Some(policy),
-            Some(running),
+            ConfigureSourcesOptions {
+                preserve_unavailable: true,
+                policy: Some(policy),
+                running: Some(running),
+                config: Some(config),
+            },
         )
     }
     pub fn activate_volume(&self, key: &str) -> Result<()> {
@@ -297,15 +518,22 @@ impl Index {
     pub fn known_roots(&self) -> Result<Vec<String>> {
         self.lock()?.get("roots", Vec::new())
     }
+    pub fn known_volumes(&self) -> Result<Vec<Volume>> {
+        Ok(self.lock()?.volumes()?.into_values().collect())
+    }
     fn configure_sources(
         &self,
         signature: &str,
         volumes: &[Volume],
         roots: &[String],
-        preserve_unavailable: bool,
-        policy: Option<Policy>,
-        running: Option<&BTreeSet<String>>,
+        options: ConfigureSourcesOptions<'_>,
     ) -> Result<bool> {
+        let ConfigureSourcesOptions {
+            preserve_unavailable,
+            policy,
+            running,
+            config,
+        } = options;
         self.writable()?;
         let _worker = self.lock_worker()?;
         let mut state = self.lock()?;
@@ -376,6 +604,45 @@ impl Index {
         ]);
         let transaction = Transaction::new_unchecked(&state.db, TransactionBehavior::Immediate)?;
         let previous: Value = state.get("identity", Value::Null)?;
+        // Roots are reconciled per verified volume below. Persist the remaining
+        // configuration separately so removing a selected root after a worker
+        // restart does not erase another volume's cursor or unfinished work.
+        let scope_contract = config.map(|config| {
+            let mut policy = config.clone();
+            policy.roots.clear();
+            json!({"signature": signature, "policy": policy.signature(),
+                "scope": config.scope, "roots": config.roots})
+        });
+        let stored_contract: Option<Value> = state.get("source_config_contract", None)?;
+        let previous_contract = stored_contract.or_else(|| {
+            // A legacy index has no separate contract. Reconstruct one only
+            // when its exact old signature proves all other settings match.
+            let mut prior = config?.clone();
+            prior.roots = serde_json::from_value(previous.get(1)?.clone()).ok()?;
+            let prior_signature = prior.signature();
+            if previous.get(0)? != &json!(prior_signature) {
+                return None;
+            }
+            let roots = std::mem::take(&mut prior.roots);
+            Some(
+                json!({"signature": prior_signature, "policy": prior.signature(),
+                "scope": prior.scope, "roots": roots}),
+            )
+        });
+        let reduced_scope = scope_contract
+            .as_ref()
+            .zip(previous_contract.as_ref())
+            .is_some_and(|(current, prior)| {
+                current["scope"] == "configured"
+                    && prior["signature"] == previous[0]
+                    && prior["policy"] == current["policy"]
+                    && current["roots"]
+                        .as_array()
+                        .zip(prior["roots"].as_array())
+                        .is_some_and(|(current, prior)| {
+                            current.iter().all(|root| prior.contains(root))
+                        })
+            });
         let mut old = state.volumes()?;
         let mut pending: BTreeMap<String, String> =
             match state.get::<Option<BTreeMap<String, String>>>("pending_baseline_roots", None)? {
@@ -386,11 +653,12 @@ impl Index {
                     .collect(),
                 None => BTreeMap::new(),
             };
-        if previous.is_null() || previous.get(0) != identity.get(0) {
+        if previous.is_null() || (previous.get(0) != identity.get(0) && !reduced_scope) {
             for table in [
                 "jobs",
                 "deferred_jobs",
-                "entries",
+                "entry_data",
+                "entry_parents",
                 "directories",
                 "volumes",
                 "scan_runs",
@@ -401,7 +669,7 @@ impl Index {
             old.clear();
             pending.clear();
         }
-        let revalidate: BTreeSet<String> = if state.get("needs_revalidation", false)? {
+        let mut revalidate: BTreeSet<String> = if state.get("needs_revalidation", false)? {
             state
                 .get("revalidation_keys", old.keys().cloned().collect::<Vec<_>>())?
                 .into_iter()
@@ -409,6 +677,15 @@ impl Index {
         } else {
             BTreeSet::new()
         };
+        let mut filename_policy_roots: BTreeSet<String> =
+            state.get(FILENAME_POLICY_PENDING_ROOTS, BTreeSet::new())?;
+        if state.get("filename_policy_revision", 0_u32)? != FILENAME_POLICY_REVISION {
+            // Revisit previously indexed regular names once under the new
+            // target policy. Preserve identities, cursors, observations, and
+            // failed jobs; the existing baseline frontier bounds this work.
+            revalidate.extend(old.keys().cloned());
+            filename_policy_roots.extend(old.values().flat_map(|v| v.roots.iter().cloned()));
+        }
         let retained: BTreeSet<String> = identities
             .iter()
             .filter(|v| {
@@ -541,11 +818,22 @@ impl Index {
                 .execute("INSERT INTO inactive_volumes VALUES (?)", [key])?;
         }
         state.set("identity", &identity)?;
+        state.set("source_config_contract", &scope_contract)?;
+        state.set("filename_policy_revision", &FILENAME_POLICY_REVISION)?;
+        filename_policy_roots.retain(|root| pending.contains_key(root));
+        state.set(FILENAME_POLICY_PENDING_ROOTS, &filename_policy_roots)?;
         state.set("roots", &roots)?;
         state.set("pending_baseline_roots", &pending)?;
         state.set("baseline_started", &pending.is_empty())?;
         state.set("needs_revalidation", &false)?;
         state.set("revalidation_keys", &Vec::<String>::new())?;
+        if let Some(policy) = &policy {
+            // Dormant explicit roots still protect their saved observations.
+            // Only the executable policy below is limited to available roots.
+            let mut saved_policy = policy.clone();
+            saved_policy.roots = roots.clone();
+            state.reconcile_hidden_directories(&saved_policy)?;
+        }
         state.refresh_baseline()?;
         let unfinished = !state.get("baseline_complete", false)?;
         transaction.commit()?;
@@ -616,7 +904,10 @@ impl Index {
                 continue;
             }
             let path = absolute(&event.path);
-            if !state.accepts(&path) || !roots.iter().any(|r| within(&path, r)) {
+            if !state.accepts(&path)
+                || (flags & IS_DIR != 0 && !policy.accepts_directory_lexically(&path))
+                || !roots.iter().any(|r| within(&path, r))
+            {
                 state.metric("excluded_events", 1)?;
                 continue;
             }
@@ -627,18 +918,19 @@ impl Index {
             if flags & IS_FILE != 0
                 && flags & CONTENT_FLAGS != 0
                 && flags & !(IS_FILE | CONTENT_FLAGS) == 0
-                && is_nfc(
-                    Path::new(&path)
+                && {
+                    let name = Path::new(&path)
                         .file_name()
                         .and_then(|s| s.to_str())
-                        .unwrap_or(""),
-                )
+                        .unwrap_or("");
+                    name.is_ascii() || filename_target(name) == name
+                }
             {
                 let mode: Option<Option<u32>> = state
                     .db
                     .query_row(
-                        "SELECT mode FROM entries WHERE path=? AND kind='file'",
-                        [&path],
+                        "SELECT mode FROM entry_data WHERE parent_id=(SELECT id FROM entry_parents WHERE path=?) AND name=? AND kind='file'",
+                        params![parent(&path), basename(&path)],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -657,7 +949,11 @@ impl Index {
             if state.accepts(&parent) {
                 state.queue(&parent, key, false, false, 0.0, false)?;
             }
-            if flags & IS_DIR != 0 && flags & REMOVED == 0 && policy.accepts_lexically(&path) {
+            if flags & IS_DIR != 0
+                && flags & REMOVED == 0
+                && policy.accepts_lexically(&path)
+                && !Policy::is_package(&path)
+            {
                 let known = state.known_directory(&path)?;
                 if !known || flags & (CREATED | RENAMED) != 0 {
                     state.queue(&path, key, true, false, 0.0, false)?;
@@ -679,9 +975,19 @@ impl Index {
         self.writable()?;
         let state = self.lock()?;
         let transaction = Transaction::new_unchecked(&state.db, TransactionBehavior::Immediate)?;
+        let filename_policy_roots: BTreeSet<String> =
+            state.get(FILENAME_POLICY_PENDING_ROOTS, BTreeSet::new())?;
         for (root, key) in state.get("pending_baseline_roots", BTreeMap::<String, String>::new())? {
-            state.queue(&root, &key, true, true, 0.0, false)?;
+            state.queue(
+                &root,
+                &key,
+                true,
+                true,
+                0.0,
+                filename_policy_roots.contains(&root),
+            )?;
         }
+        state.set(FILENAME_POLICY_PENDING_ROOTS, &BTreeSet::<String>::new())?;
         state.set("pending_baseline_roots", &BTreeMap::<String, String>::new())?;
         state.set("baseline_started", &true)?;
         state.refresh_baseline()?;
@@ -742,47 +1048,82 @@ impl Index {
                     state.queue(&path, &owner, false, false, 0.0, true)?;
                 }
             }
-            // Let cheap ordinary observations share a bounded burst before
-            // rotating through failed, persisted backlog, and baseline work. Check elapsed time
-            // before selection so a slow ordinary operation yields next turn.
+            // Fresh intake and background traversal each receive a bounded burst.
+            // Otherwise every slow retry permits only one cheap saved directory
+            // to advance. Baseline and persisted work alternate within the same
+            // budget, so a fresh event waits for at most one background burst.
+            // Check time before selection so slow work yields next turn.
             let selected_at = scheduling_now();
-            let burst_expired = state.ordinary_burst.is_some_and(|(started, count)| {
+            let burst_expired = state.ready_burst.is_some_and(|(_, started, count)| {
                 count >= ORDINARY_BURST_LIMIT
                     || selected_at.saturating_duration_since(started) >= ORDINARY_BURST_TIME
             });
             let next_ready_class = if burst_expired {
-                2
+                if state.ready_burst.unwrap().0 == 1 {
+                    2
+                } else {
+                    1
+                }
             } else {
                 state.next_ready_class
             };
+            let background_burst =
+                state.ready_burst.is_some_and(|(group, _, _)| group == 3) && !burst_expired;
             // Explicit intake is FIFO, ahead of implicit legacy/frontier work.
             // Repeated short paths must not outrank older directory requests.
+            // Within implicit traversal, finish actual retained snapshots before
+            // opening more directories. Durable scan_runs also includes overflow
+            // receipts whose in-memory snapshot was dropped, so it is insufficient.
+            let continuation_order = if retained.is_empty() {
+                "NULL".to_owned()
+            } else {
+                format!(
+                    "CASE WHEN ordinary_scope=0 AND ready_class IN (0,3) AND path IN ({}) THEN 0 ELSE 1 END",
+                    vec!["?"; retained.len()].join(",")
+                )
+            };
+            let mut selection = vec![
+                SqlValue::Integer(state.startup_rowid),
+                SqlValue::Real(now()),
+                SqlValue::Integer(i64::from(background_burst)),
+                SqlValue::Integer(next_ready_class),
+                SqlValue::Integer(next_ready_class),
+            ];
+            selection.extend(retained.iter().cloned().map(SqlValue::Text));
             let job = state.db.query_row(
-                "SELECT *, CASE WHEN ordinary_scope>0 THEN CASE WHEN rowid>? THEN 1 ELSE 3 END
+                &format!("SELECT *, CASE WHEN ordinary_scope>0 THEN CASE WHEN rowid>? THEN 1 ELSE 3 END
                  WHEN attempts>0 AND error IS NOT NULL THEN 2 WHEN baseline=1 THEN 0 ELSE 3 END AS ready_class
                  FROM jobs WHERE next_attempt<=? AND volume_key NOT IN (SELECT key FROM inactive_volumes)
-                 ORDER BY (ready_class+4-?)%4, CASE WHEN ordinary_scope>0 THEN 0 ELSE 1 END,
+                 ORDER BY CASE WHEN ? THEN CASE WHEN ready_class=? THEN 0 WHEN ready_class IN (0,3) THEN 1 WHEN ready_class=1 THEN 2 ELSE 3 END ELSE (ready_class+4-?)%4 END,
+                 CASE WHEN ordinary_scope>0 THEN 0 ELSE 1 END,
+                 {continuation_order},
                  CASE WHEN ordinary_scope>0 THEN rowid ELSE next_attempt END,
-                 recursive ASC, length(path), path LIMIT 1",
-                params![state.startup_rowid, now(), next_ready_class], Job::from_row,
+                 recursive ASC, length(path), path LIMIT 1"),
+                params_from_iter(selection), Job::from_row,
             ).optional()?;
             let roots = state.get("roots", Vec::<String>::new())?;
             let configured = job.as_ref().is_some_and(|j| roots.contains(&j.path));
             transaction.commit()?;
             let Some(job) = job else {
-                state.ordinary_burst = None;
+                state.ready_burst = None;
+                state.next_ready_class = 1;
                 return Ok(false);
             };
-            if job.ready_class == 1 {
-                let (started, count) = if burst_expired {
-                    (selected_at, 0)
-                } else {
-                    state.ordinary_burst.unwrap_or((selected_at, 0))
+            if matches!(job.ready_class, 0 | 1 | 3) {
+                // Group 1 is live intake; group 3 shares baseline/frontier time.
+                let group = if job.ready_class == 1 { 1 } else { 3 };
+                let (_, started, count) = state
+                    .ready_burst
+                    .filter(|(previous, _, _)| !burst_expired && *previous == group)
+                    .unwrap_or((group, selected_at, 0));
+                state.ready_burst = Some((group, started, count + 1));
+                state.next_ready_class = match job.ready_class {
+                    0 => 3,
+                    3 => 0,
+                    _ => 1,
                 };
-                state.ordinary_burst = Some((started, count + 1));
-                state.next_ready_class = 1;
             } else {
-                state.ordinary_burst = None;
+                state.ready_burst = None;
                 state.next_ready_class = (job.ready_class + 1) % 4;
             }
             let mut active = job.clone();
@@ -802,6 +1143,10 @@ impl Index {
                 .collect();
             (job, configured, nested_roots)
         };
+        crate::activity::current(|a| {
+            a.select_scope(&uuid::Uuid::new_v4().to_string(), &job.path, 0, 0, None);
+            a.begin("opening_directory", Some(&job.path));
+        });
         // Filesystem work deliberately occurs with no SQLite lock or transaction.
         let observed = (|| -> Result<ScanResult> {
             if configured_root {
@@ -854,17 +1199,18 @@ impl Index {
         };
         // Root disappearance is filesystem evidence, collected outside SQLite.
         // An inaccessible root remains protected; absence alone permits pruning.
-        let missing_roots: BTreeSet<String> = if result.complete && result.errors.is_empty() {
-            nested_roots
-                .into_iter()
-                .filter(|root| {
-                    crate::directory_io::metadata(Path::new(root), false)
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                })
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+        let missing_roots: BTreeSet<String> =
+            if result.complete && !result.traversal_skipped && result.errors.is_empty() {
+                nested_roots
+                    .into_iter()
+                    .filter(|root| {
+                        crate::directory_io::metadata(Path::new(root), false)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    })
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
         let mut state = self.lock()?;
         state.active_job = None;
         let transaction = Transaction::new_unchecked(&state.db, TransactionBehavior::Immediate)?;
@@ -875,6 +1221,20 @@ impl Index {
             if !result.complete {
                 bail!("partial observation has no scan identity");
             }
+        }
+        if result.traversal_skipped {
+            // stage_scan above restores the generation that began a chunked
+            // observation. A newer event must survive acknowledgement here.
+            let acknowledged = state.db.execute(
+                "DELETE FROM jobs WHERE path=? AND generation=?",
+                params![job.path, job.generation],
+            )?;
+            state.yield_newer_request(&job, acknowledged)?;
+            state.clear_scan(&job.path)?;
+            state.drain_deferred()?;
+            state.refresh_baseline()?;
+            transaction.commit()?;
+            return Ok(true);
         }
         state.metric(
             "renamed",
@@ -929,21 +1289,7 @@ impl Index {
                 params![job.path, job.generation],
             )?
         };
-        if acknowledged == 0
-            && state
-                .db
-                .query_row(
-                    "SELECT ordinary_scope>0 FROM jobs WHERE path=? AND generation<>?",
-                    params![job.path, job.generation],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()?
-                .unwrap_or(false)
-        {
-            // This observation consumed its turn. A newer in-flight request
-            // remains durable, but must yield to other already queued work.
-            state.move_to_queue_tail(&job.path)?;
-        }
+        state.yield_newer_request(&job, acknowledged)?;
         let actual_scope = absolute(if result.scope.is_empty() {
             &job.path
         } else {
@@ -958,8 +1304,10 @@ impl Index {
         // Acknowledge the parent before queueing children, or coalescing would
         // absorb the frontier back into the recursive parent that just finished.
         if result.scan_id.is_some() {
-            let mut statement = state.db.prepare("SELECT seen.path FROM scan_seen seen JOIN entries ON entries.path=seen.path WHERE seen.scope=? AND entries.kind IN ('directory','dir')")?;
-            for child in statement.query_map([&job.path], |row| row.get::<_, String>(0))? {
+            let mut statement = state.db.prepare("SELECT entries.path FROM entries JOIN scan_seen seen ON seen.path=entries.path AND seen.scope=? WHERE entries.parent=? AND entries.kind IN ('directory','dir')")?;
+            for child in statement.query_map(params![job.path, actual_scope], |row| {
+                row.get::<_, String>(0)
+            })? {
                 state.queue_child(&job, &child?)?;
             }
         } else {
@@ -983,7 +1331,7 @@ impl Index {
             if directories.contains(&parent(&failed)) && !directories.contains(&failed) {
                 let kind: Option<String> = state
                     .db
-                    .query_row("SELECT kind FROM entries WHERE path=?", [&failed], |r| {
+                    .query_row("SELECT kind FROM entry_data WHERE parent_id=(SELECT id FROM entry_parents WHERE path=?) AND name=?", params![parent(&failed),basename(&failed)], |r| {
                         r.get(0)
                     })
                     .optional()?;
@@ -1076,9 +1424,18 @@ impl Index {
                     .collect::<Vec<_>>()
             ),
         );
+        let entry_table = if state.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='entries' AND type='view')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            "entry_data"
+        } else {
+            "entries"
+        };
         for (key, table) in [
             ("pending_jobs", "jobs"),
-            ("indexed_entries", "entries"),
+            ("indexed_entries", entry_table),
             ("indexed_directories", "directories"),
             ("deferred_jobs", "deferred_jobs"),
         ] {
@@ -1120,6 +1477,75 @@ impl Index {
         })))?.collect::<rusqlite::Result<Vec<_>>>()?;
         result.insert("directory_retry_count".into(), json!(retry_count));
         result.insert("directory_retry_items".into(), json!(retry_items));
+        // Diagnostic totals retain dormant obligations. The menu describes only
+        // executable work, using the same inactive-volume boundary as the worker.
+        let active = "volume_key NOT IN (SELECT key FROM inactive_volumes)";
+        let mut current = serde_json::Map::new();
+        for (key, table) in [("pending_jobs", "jobs"), ("deferred_jobs", "deferred_jobs")] {
+            let count: i64 = state.db.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {active}"),
+                [],
+                |r| r.get(0),
+            )?;
+            current.insert(key.into(), json!(count));
+        }
+        current.insert(
+            "pending_jobs".into(),
+            json!(
+                current["pending_jobs"].as_i64().unwrap()
+                    + current["deferred_jobs"].as_i64().unwrap()
+            ),
+        );
+        let next: Option<f64> = state.db.query_row(
+            &format!("SELECT MIN(next_attempt) FROM jobs WHERE next_attempt>0 AND attempts>0 AND error IS NOT NULL AND {active}"),
+            [],
+            |r| r.get(0),
+        )?;
+        current.insert("next_retry".into(), json!(next));
+        let retry_count: i64 = state.db.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM jobs WHERE attempts>0 AND error IS NOT NULL AND {active}"
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        let retry_items = state.db.prepare(&format!("SELECT path, error, attempts, next_attempt FROM jobs WHERE attempts>0 AND error IS NOT NULL AND {active} ORDER BY next_attempt, path LIMIT 8"))?.query_map([], |r| Ok(json!({
+            "path":r.get::<_, String>(0)?, "reason":r.get::<_, String>(1)?,
+            "attempts":r.get::<_, i64>(2)?, "next_retry":r.get::<_, f64>(3)?
+        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        current.insert("directory_retry_count".into(), json!(retry_count));
+        current.insert("directory_retry_items".into(), json!(retry_items));
+        let inactive = state
+            .db
+            .prepare("SELECT key FROM inactive_volumes")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let pending = state
+            .get("pending_baseline_roots", BTreeMap::<String, String>::new())?
+            .into_iter()
+            .filter(|(_, key)| !inactive.contains(key))
+            .map(|(root, _)| root)
+            .collect::<Vec<_>>();
+        let mut unfinished = !pending.is_empty();
+        for table in ["jobs", "deferred_jobs"] {
+            unfinished |= state.db.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE baseline=1 AND {active})"),
+                [],
+                |r| r.get::<_, bool>(0),
+            )?;
+        }
+        current.insert("pending_baseline_roots".into(), json!(pending));
+        current.insert("baseline_complete".into(), json!(!unfinished));
+        let revalidating = state.get("needs_revalidation", false)?
+            && state
+                .get(
+                    "revalidation_keys",
+                    state.volumes()?.into_keys().collect::<Vec<_>>(),
+                )?
+                .iter()
+                .any(|key| !inactive.contains(key));
+        current.insert("needs_revalidation".into(), json!(revalidating));
+        result.insert("current".into(), Value::Object(current));
         let mut cursors = BTreeMap::new();
         for row in state
             .db
@@ -1337,6 +1763,13 @@ impl State {
         )
     }
     fn queue_intent(&self, path: &str, key: &str, intent: QueueIntent) -> Result<()> {
+        if self
+            .policy
+            .as_ref()
+            .is_some_and(|policy| !policy.accepts_directory_lexically(path))
+        {
+            return Ok(());
+        }
         let QueueIntent {
             recursive,
             baseline,
@@ -1425,6 +1858,24 @@ impl State {
         }
         Ok(())
     }
+    fn yield_newer_request(&self, job: &Job, acknowledged: usize) -> Result<()> {
+        if acknowledged == 0
+            && self
+                .db
+                .query_row(
+                    "SELECT ordinary_scope>0 FROM jobs WHERE path=? AND generation<>?",
+                    params![job.path, job.generation],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false)
+        {
+            // This observation consumed its turn. A newer in-flight request
+            // remains durable, but must yield to other already queued work.
+            self.move_to_queue_tail(&job.path)?;
+        }
+        Ok(())
+    }
     fn move_to_queue_tail(&self, path: &str) -> Result<()> {
         let current: i64 =
             self.db
@@ -1473,7 +1924,122 @@ impl State {
         }
         Ok(())
     }
+    fn reconcile_hidden_directories(&self, policy: &Policy) -> Result<()> {
+        // This upgrade changes executable coverage, not volume identity. Keep
+        // cursors and ordinary observations; revisit only when roots change.
+        let identity = json!([1, policy.roots.iter().collect::<BTreeSet<_>>()]);
+        if self.get::<Value>("hidden_directory_policy", Value::Null)? == identity {
+            return Ok(());
+        }
+        self.db.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS hidden_directory_candidates(path TEXT PRIMARY KEY);
+             CREATE TEMP TABLE IF NOT EXISTS hidden_directory_boundaries(path TEXT PRIMARY KEY);
+             DELETE FROM hidden_directory_candidates;
+             DELETE FROM hidden_directory_boundaries;",
+        )?;
+        // Parent interning bounds the common scan by directory count. Include
+        // unvisited empty directories and durable work with no observations too.
+        for table in [
+            "entry_parents",
+            "directories",
+            "jobs",
+            "deferred_jobs",
+            "scan_runs",
+        ] {
+            self.db.execute(
+                &format!("INSERT OR IGNORE INTO hidden_directory_candidates SELECT path FROM {table} WHERE instr(path,'/.')>0"),
+                [],
+            )?;
+        }
+        self.db.execute(
+            "INSERT OR IGNORE INTO hidden_directory_candidates
+             SELECT p.path||CASE WHEN p.path='/' THEN '' ELSE '/' END||e.name
+             FROM entry_data e JOIN entry_parents p ON p.id=e.parent_id
+             WHERE e.kind IN ('directory','dir') AND substr(e.name,1,1)='.'",
+            [],
+        )?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO hidden_directory_candidates SELECT scope FROM scan_seen WHERE instr(scope,'/.')>0",
+            [],
+        )?;
+        for path in self
+            .db
+            .prepare("SELECT path FROM hidden_directory_candidates")?
+            .query_map([], |row| row.get::<_, String>(0))?
+        {
+            if let Some(boundary) = policy.hidden_directory_boundary(&path?, true) {
+                self.db.execute(
+                    "INSERT OR IGNORE INTO hidden_directory_boundaries VALUES (?)",
+                    [&boundary],
+                )?;
+            }
+        }
+        let preserve: Vec<String> = policy
+            .roots
+            .iter()
+            .filter(|root| policy.accepts_directory_lexically(root))
+            .cloned()
+            .collect();
+        for path in self
+            .db
+            .prepare("SELECT path FROM hidden_directory_boundaries ORDER BY length(path),path")?
+            .query_map([], |row| row.get::<_, String>(0))?
+        {
+            let path = path?;
+            // Explicit nested selections survive pruning of an automatic
+            // parent's hidden subtree. Other hidden descendants remain excluded.
+            let preserved: Vec<_> = preserve
+                .iter()
+                .filter(|root| within(root, &path))
+                .cloned()
+                .collect();
+            self.prune(&path, true, &preserved)?;
+            let range = |column: &str| {
+                let prefix = path.trim_end_matches('/').to_owned() + "/";
+                let mut condition = format!("({column}=? OR ({column}>=? AND {column}<?))");
+                let mut values = vec![
+                    SqlValue::Text(path.clone()),
+                    SqlValue::Text(prefix.clone()),
+                    SqlValue::Text(prefix + "\u{10ffff}"),
+                ];
+                for root in &preserved {
+                    let prefix = root.trim_end_matches('/').to_owned() + "/";
+                    condition += &format!(" AND NOT ({column}=? OR ({column}>=? AND {column}<?))");
+                    values.extend([
+                        SqlValue::Text(root.clone()),
+                        SqlValue::Text(prefix.clone()),
+                        SqlValue::Text(prefix + "\u{10ffff}"),
+                    ]);
+                }
+                (condition, values)
+            };
+            let (condition, values) = range("path");
+            for table in ["jobs", "deferred_jobs", "scan_runs", "scan_seen"] {
+                self.db.execute(
+                    &format!("DELETE FROM {table} WHERE {condition}"),
+                    params_from_iter(values.iter()),
+                )?;
+            }
+            let (condition, values) = range("scope");
+            self.db.execute(
+                &format!("DELETE FROM scan_seen WHERE {condition}"),
+                params_from_iter(values.iter()),
+            )?;
+        }
+        let mut pending: BTreeMap<String, String> =
+            self.get("pending_baseline_roots", BTreeMap::new())?;
+        pending.retain(|root, _| policy.hidden_directory_boundary(root, true).is_none());
+        self.set("pending_baseline_roots", &pending)?;
+        self.set("hidden_directory_policy", &identity)?;
+        self.db.execute_batch(
+            "DELETE FROM hidden_directory_candidates; DELETE FROM hidden_directory_boundaries;",
+        )?;
+        Ok(())
+    }
     fn prune(&self, path: &str, include_self: bool, preserve: &[String]) -> Result<()> {
+        if preserve.iter().any(|root| within(path, root)) {
+            return Ok(());
+        }
         let prefix = path.trim_end_matches('/').to_owned() + "/";
         let mut condition = "(path>=? AND path<?".to_owned();
         let mut values = vec![
@@ -1494,16 +2060,75 @@ impl State {
                 SqlValue::Text(prefix + "\u{10ffff}"),
             ]);
         }
-        for table in ["entries", "directories"] {
-            self.db.execute(
-                &format!("DELETE FROM {table} WHERE {condition}"),
-                params_from_iter(values.iter()),
-            )?;
+        self.db.execute(
+            &format!("DELETE FROM directories WHERE {condition}"),
+            params_from_iter(values.iter()),
+        )?;
+        // A path range over interned parents finds every descendant without
+        // reconstructing or scanning the paths of unrelated observations.
+        let prefix = path.trim_end_matches('/').to_owned() + "/";
+        let mut parents = "(path=? OR (path>=? AND path<?))".to_owned();
+        let mut values = vec![
+            SqlValue::Text(path.into()),
+            SqlValue::Text(prefix.clone()),
+            SqlValue::Text(prefix + "\u{10ffff}"),
+        ];
+        for root in preserve {
+            let prefix = root.trim_end_matches('/').to_owned() + "/";
+            parents += " AND NOT (path=? OR (path>=? AND path<?))";
+            values.extend([
+                SqlValue::Text(root.clone()),
+                SqlValue::Text(prefix.clone()),
+                SqlValue::Text(prefix + "\u{10ffff}"),
+            ]);
+        }
+        let mut deletion = format!(
+            "DELETE FROM entry_data WHERE parent_id IN (SELECT id FROM entry_parents WHERE {parents})"
+        );
+        let mut deletion_values = values.clone();
+        for root in preserve {
+            deletion +=
+                " AND NOT (parent_id IN (SELECT id FROM entry_parents WHERE path=?) AND name=?)";
+            deletion_values.extend([
+                SqlValue::Text(parent(root)),
+                SqlValue::Text(basename(root).into()),
+            ]);
+        }
+        self.db
+            .execute(&deletion, params_from_iter(deletion_values.iter()))?;
+        self.db.execute(&format!("DELETE FROM entry_parents WHERE {parents} AND NOT EXISTS(SELECT 1 FROM entry_data WHERE parent_id=entry_parents.id)"), params_from_iter(values.iter()))?;
+        if include_self {
+            let parent = parent(path);
+            self.db.execute("DELETE FROM entry_data WHERE parent_id=(SELECT id FROM entry_parents WHERE path=?) AND name=?", params![parent,basename(path)])?;
+            self.db.execute("DELETE FROM entry_parents WHERE path=? AND NOT EXISTS(SELECT 1 FROM entry_data WHERE parent_id=entry_parents.id)", [&parent])?;
         }
         Ok(())
     }
+    fn observe_entry(&self, item: &Entry) -> Result<()> {
+        let parent = parent(&item.path);
+        self.db.execute(
+            "INSERT OR IGNORE INTO entry_parents(path) VALUES (?)",
+            [&parent],
+        )?;
+        self.db.execute(
+            "INSERT INTO entry_data(parent_id,name,kind,dev,ino,mtime_ns,ctime_ns,size,mode)
+             VALUES((SELECT id FROM entry_parents WHERE path=?),?,?,?,?,?,?,?,?)
+             ON CONFLICT(parent_id,name) DO UPDATE SET
+                kind=excluded.kind,dev=excluded.dev,ino=excluded.ino,mtime_ns=excluded.mtime_ns,
+                ctime_ns=excluded.ctime_ns,size=excluded.size,mode=excluded.mode
+             WHERE entry_data.kind IS NOT excluded.kind OR entry_data.dev IS NOT excluded.dev OR
+                entry_data.ino IS NOT excluded.ino OR entry_data.mtime_ns IS NOT excluded.mtime_ns OR
+                entry_data.ctime_ns IS NOT excluded.ctime_ns OR entry_data.size IS NOT excluded.size OR
+                entry_data.mode IS NOT excluded.mode",
+            params![parent,basename(&item.path),item.kind,sqlite_unsigned(item.dev),sqlite_unsigned(item.ino),item.mtime_ns,item.ctime_ns,sqlite_unsigned(item.size),item.mode],
+        )?;
+        Ok(())
+    }
     fn queue_child(&self, job: &Job, child: &str) -> Result<()> {
-        if self.accepts(child) && (job.scans_recursively() || !self.known_directory(child)?) {
+        if self.accepts(child)
+            && !Policy::is_package(child)
+            && (job.scans_recursively() || !self.known_directory(child)?)
+        {
             self.queue(
                 child,
                 &job.volume_key,
@@ -1578,8 +2203,8 @@ impl State {
             let old: Option<(String, SqlValue, SqlValue)> = self
                 .db
                 .query_row(
-                    "SELECT kind,dev,ino FROM entries WHERE path=?",
-                    [&item.path],
+                    "SELECT kind,dev,ino FROM entry_data WHERE parent_id=(SELECT id FROM entry_parents WHERE path=?) AND name=?",
+                    params![parent(&item.path),basename(&item.path)],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
@@ -1595,7 +2220,7 @@ impl State {
                 self.db
                     .execute("DELETE FROM directories WHERE path=?", [&item.path])?;
             }
-            self.db.execute("INSERT OR REPLACE INTO entries(path,parent,kind,dev,ino,mtime_ns,ctime_ns,size,mode) VALUES(?,?,?,?,?,?,?,?,?)", params![item.path,parent(&item.path),item.kind,sqlite_unsigned(item.dev),sqlite_unsigned(item.ino),item.mtime_ns,item.ctime_ns,sqlite_unsigned(item.size),item.mode])?;
+            self.observe_entry(item)?;
             self.db.execute(
                 "INSERT OR IGNORE INTO scan_seen VALUES (?,?)",
                 params![job.path, item.path],
@@ -1728,7 +2353,7 @@ impl State {
             if !result.errors.is_empty() && !directories.contains(&parent(&item.path)) {
                 continue;
             }
-            self.db.execute("INSERT OR REPLACE INTO entries (path, parent, kind, dev, ino, mtime_ns, ctime_ns, size, mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", params![item.path, parent(&item.path), item.kind, sqlite_unsigned(item.dev), sqlite_unsigned(item.ino), item.mtime_ns, item.ctime_ns, sqlite_unsigned(item.size), item.mode])?;
+            self.observe_entry(item)?;
         }
         Ok(directories)
     }

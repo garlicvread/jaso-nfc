@@ -37,9 +37,8 @@ pub fn absolute(path: &str) -> String {
         .to_owned()
 }
 
-// Google Drive's provider-root staging store is infrastructure, not the user's
-// document tree. Do not generalize this to hidden folders inside My Drive or to
-// similarly named directories elsewhere on disk.
+// Google Drive's provider-root staging store remains excluded even if selected
+// explicitly. Other hidden directories follow the ordinary selected-root rule.
 pub fn is_managed_cloud_path(path: &str) -> bool {
     Path::new(path).ancestors().any(|part| {
         if part.file_name().is_none_or(|name| name != ".tmp") {
@@ -128,9 +127,31 @@ impl Policy {
     pub fn accepts_lexically(&self, path: &str) -> bool {
         self.accepts_impl(path, false)
     }
+    /// Queued scopes are directories, so even the final component can be
+    /// excluded without probing the filesystem. Ordinary dotfiles remain data.
+    pub fn accepts_directory_lexically(&self, path: &str) -> bool {
+        self.accepts_lexically(path) && self.hidden_directory_boundary(path, true).is_none()
+    }
+    /// The most specific selected root is an explicit boundary. Hidden
+    /// directories above that root do not authorize hidden descendants below it.
+    pub(crate) fn hidden_directory_boundary(&self, path: &str, directory: bool) -> Option<String> {
+        let path = absolute(path);
+        let root = self.root_for(&path)?;
+        let components: Vec<_> = Path::new(&path).components().collect();
+        let count = components.len().saturating_sub(usize::from(!directory));
+        let root_depth = Path::new(&root).components().count();
+        let mut ancestor: PathBuf = components.iter().take(root_depth).collect();
+        for part in components.into_iter().take(count).skip(root_depth) {
+            ancestor.push(part.as_os_str());
+            if part.as_os_str().as_encoded_bytes().starts_with(b".") {
+                return Some(ancestor.to_string_lossy().into_owned());
+            }
+        }
+        None
+    }
     fn accepts_impl(&self, path: &str, check_filesystem: bool) -> bool {
         let path = absolute(path);
-        if is_managed_cloud_path(&path) {
+        if is_managed_cloud_path(&path) || self.hidden_directory_boundary(&path, false).is_some() {
             return false;
         }
         let Some(root) = self.root_for(&path) else {
@@ -148,6 +169,7 @@ impl Policy {
         }
         for top in &self.skip_hidden_tops {
             if within(&path, top)
+                && (nfc(&root) == nfc(top) || !within(&root, top))
                 && nfc(&path) != nfc(top)
                 && Path::new(&path)
                     .components()
@@ -156,6 +178,13 @@ impl Policy {
             {
                 return false;
             }
+        }
+        if check_filesystem
+            && self.hidden_directory_boundary(&path, true).is_some()
+            && crate::directory_io::metadata(Path::new(&path), false)
+                .is_ok_and(|info| info.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32)
+        {
+            return false;
         }
         let boundary = self
             .roots
@@ -201,15 +230,7 @@ impl Policy {
         if info.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
             return true;
         }
-        let extension = Path::new(path)
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if matches!(
-            extension.as_str(),
-            "app" | "photoslibrary" | "musiclibrary" | "tvlibrary" | "aplibrary" | "framework"
-        ) {
+        if Self::is_package(path) {
             return true;
         }
         if configured_root {
@@ -220,15 +241,152 @@ impl Policy {
             p.st_dev != info.st_dev || (p.st_dev == info.st_dev && p.st_ino == info.st_ino)
         })
     }
+    /// A directory's package spelling is available to scheduling without I/O.
+    pub(crate) fn is_package(path: &str) -> bool {
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        matches!(
+            extension.as_str(),
+            "app" | "photoslibrary" | "musiclibrary" | "tvlibrary" | "aplibrary" | "framework"
+        )
+    }
     pub fn descend(&self, path: &str) -> bool {
         let path = absolute(path);
-        self.accepts(&path) && !Self::blocked_directory(&path, self.is_root(&path))
+        self.accepts_directory_lexically(&path)
+            && self.accepts(&path)
+            && !Self::blocked_directory(&path, self.is_root(&path))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hidden_directories_are_skipped_at_every_depth_but_dotfiles_remain_data() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_str().unwrap();
+        std::fs::create_dir_all(d.path().join("Documents/project/.venv")).unwrap();
+        std::fs::create_dir(d.path().join(".ghost-alice")).unwrap();
+        std::fs::write(d.path().join("Documents/.notes"), b"document").unwrap();
+        let p = Policy::new(
+            vec![root.into()],
+            vec![],
+            vec![".git".into()],
+            vec![],
+            HashMap::new(),
+        );
+        for suffix in [".ghost-alice", "Documents/project/.venv"] {
+            let hidden = format!("{root}/{suffix}");
+            assert!(
+                !p.accepts(&hidden),
+                "hidden directory must be excluded: {hidden}"
+            );
+            assert!(!p.descend(&hidden));
+            assert!(!p.accepts_lexically(&format!("{hidden}/file")));
+        }
+        assert!(p.accepts(&format!("{root}/Documents/.notes")));
+        assert!(p.accepts_lexically(&format!("{root}/Documents/report.txt")));
+    }
+
+    #[test]
+    fn explicit_hidden_root_only_opens_its_own_visible_descendants() {
+        let root = "/Users/example";
+        let selected = format!("{root}/.archive/data");
+        let p = Policy::new(
+            vec![root.into(), selected.clone()],
+            vec![format!("{selected}/Private")],
+            vec![".git".into()],
+            vec![root.into()],
+            HashMap::new(),
+        );
+        assert!(p.accepts_lexically(&selected));
+        assert!(p.accepts_lexically(&format!("{selected}/report.txt")));
+        for suffix in [".cache/file", ".git/config", "Private/file"] {
+            assert!(!p.accepts_lexically(&format!("{selected}/{suffix}")));
+        }
+        assert!(!p.accepts_lexically(&format!("{root}/.archive/other/file")));
+        assert!(!p.accepts_lexically(&format!("{root}/.ghost-alice/file")));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn legacy_automatic_policy_never_walks_hidden_application_trees() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("home");
+        for directory in [
+            "Documents/project/.venv",
+            ".ghost-alice",
+            "Library/CloudStorage/Provider/My Drive",
+        ] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for file in [
+            "Documents/.notes",
+            "Documents/report.txt",
+            ".ghost-alice/private",
+            "Documents/project/.venv/private",
+            "Library/CloudStorage/Provider/My Drive/report.txt",
+        ] {
+            std::fs::write(root.join(file), b"fixture").unwrap();
+        }
+        let home = root.to_string_lossy().into_owned();
+        let cloud = root
+            .join("Library/CloudStorage")
+            .to_string_lossy()
+            .into_owned();
+        let config = crate::config::Config {
+            scope: "all-user-files".into(),
+            roots: vec![],
+            excludes: vec![],
+            skip_hidden_tops: vec![],
+            state_dir: d.path().join("state").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let coverage = crate::coverage::Coverage {
+            roots: vec![home.clone(), cloud.clone()],
+            root_excludes: HashMap::from([(home.clone(), vec![format!("{home}/Library")])]),
+            ..Default::default()
+        };
+        let p = crate::sources::policy_for(&config, &coverage, None);
+        let mut engine = crate::normalizer::Normalizer::new(p, None, None, None, false).unwrap();
+        let result = engine.reconcile(&home, true).unwrap();
+        assert!(result.errors.is_empty());
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|item| item.path == format!("{home}/Documents/.notes"))
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|item| item.path == format!("{home}/Documents/report.txt"))
+        );
+        assert!(
+            !result
+                .entries
+                .iter()
+                .any(|item| item.path.contains(".ghost-alice") || item.path.contains(".venv"))
+        );
+        assert!(
+            !result
+                .directories
+                .iter()
+                .any(|path| path.contains(".ghost-alice") || path.contains(".venv"))
+        );
+        let cloud_result = engine.reconcile(&cloud, true).unwrap();
+        assert!(
+            cloud_result
+                .entries
+                .iter()
+                .any(|item| item.path.ends_with("My Drive/report.txt"))
+        );
+    }
+
     #[test]
     fn explicit_cloud_overrides_only_scoped_exclusion() {
         let p = Policy::new(
@@ -275,22 +433,33 @@ mod tests {
         assert!(!p.accepts(&staging), "provider staging must not be renamed");
         assert!(!p.accepts(&format!("{staging}/205/document")));
         assert!(!p.descend(&format!("{staging}/205")));
+        for suffix in ["My Drive/document", "Shared drives/document"] {
+            assert!(
+                p.accepts(&format!("{cloud}/GoogleDrive-account/{suffix}")),
+                "visible user content remains covered: {suffix}"
+            );
+        }
         for suffix in [
-            "My Drive/document",
             "My Drive/.tmp/document",
             "Shared drives/.tmp/document",
             ".shortcut-targets-by-id/123/document",
             ".tmp-not-staging/document",
         ] {
             assert!(
-                p.accepts(&format!("{cloud}/GoogleDrive-account/{suffix}")),
-                "user content remains covered: {suffix}"
+                !p.accepts(&format!("{cloud}/GoogleDrive-account/{suffix}")),
+                "hidden subtrees require an explicit selection: {suffix}"
             );
         }
-        assert!(p.accepts(&format!("{cloud}/OtherProvider/.tmp/document")));
+        assert!(!p.accepts(&format!("{cloud}/OtherProvider/.tmp/document")));
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_str().unwrap();
-        let p = Policy::new(vec![root.into()], vec![], vec![], vec![], HashMap::new());
+        let p = Policy::new(
+            vec![root.into(), format!("{root}/GoogleDrive-account/.tmp")],
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
         assert!(p.accepts(&format!("{root}/GoogleDrive-account/.tmp/document")));
         assert!(!is_managed_cloud_path(
             "/Users/example/Documents/archive/Library/CloudStorage/GoogleDrive-copy/.tmp/user-file"

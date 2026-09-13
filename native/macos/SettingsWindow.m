@@ -46,17 +46,32 @@ static NSView *SettingsGroup(NSStackView *stack) {
 @interface JasoSettingsBackground : NSView
 @end
 @implementation JasoSettingsBackground
-- (void)drawRect:(NSRect)dirtyRect { [NSColor.windowBackgroundColor setFill]; NSRectFill(dirtyRect); }
+- (void)drawRect:(NSRect)dirtyRect { [NSColor.windowBackgroundColor setFill]; NSRectFill(NSIntersectionRect(dirtyRect, self.bounds)); }
 - (void)viewDidChangeEffectiveAppearance { [super viewDidChangeEffectiveAppearance]; self.needsDisplay = YES; }
+@end
+@interface JasoSettingsClip : NSClipView
+@end
+@implementation JasoSettingsClip
+- (BOOL)isFlipped { return YES; }
 @end
 
 @interface JasoSettingsWindowController ()
+@property NSView *contentRoot;
+@property (weak) NSWindow *hostWindow;
+@property NSLayoutConstraint *standaloneWidth;
+@property NSButton *advancedDisclosure;
+@property NSView *advancedContent;
+@property BOOL advancedExpanded;
+@property NSButton *storageButton;
+@property NSButton *guideButton;
+@property NSArray<NSButton *> *maintenanceButtons;
 @property NSScrollView *scroll;
 @property NSStackView *body;
 @property NSTextField *headingLabel;
 @property NSTextField *foldersLabel;
 @property NSTextField *foldersGuide;
 @property NSButton *foldersButton;
+@property NSView *foldersGroup;
 @property NSTextField *languageLabel;
 @property NSTextField *explanationLabel;
 @property NSPopUpButton *languagePicker;
@@ -89,9 +104,11 @@ static NSView *SettingsGroup(NSStackView *stack) {
     window.releasedWhenClosed = NO; window.delegate = self; window.minSize = NSMakeSize(560, 520); [window center];
     [NSUserDefaults.standardUserDefaults registerDefaults:@{@"animateMark":@YES, @"markStyle":@1}];
     window.contentView = [[JasoSettingsBackground alloc] initWithFrame:window.contentView.bounds];
-    [window.contentView.widthAnchor constraintGreaterThanOrEqualToConstant:560].active = YES;
-    [window.contentView.widthAnchor constraintEqualToAnchor:((NSLayoutGuide *)window.contentLayoutGuide).widthAnchor].active = YES;
+    self.contentRoot = window.contentView;
+    self.standaloneWidth = [window.contentView.widthAnchor constraintEqualToAnchor:((NSLayoutGuide *)window.contentLayoutGuide).widthAnchor];
+    self.standaloneWidth.active = YES;
     self.scroll = [NSScrollView new]; self.scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    self.scroll.contentView = JasoSettingsClip.new; self.scroll.contentView.drawsBackground = NO;
     self.scroll.hasVerticalScroller = YES; self.scroll.autohidesScrollers = YES; self.scroll.drawsBackground = NO;
     [window.contentView addSubview:self.scroll];
     self.body = SettingsStack(); self.body.spacing = 20; self.body.edgeInsets = NSEdgeInsetsMake(24, 28, 24, 28);
@@ -113,7 +130,7 @@ static NSView *SettingsGroup(NSStackView *stack) {
     self.foldersButton = [NSButton buttonWithTitle:@"" target:self action:@selector(permissionsAction:)];
     self.foldersButton.identifier = @"setup-folders";
     for (NSView *view in @[self.foldersLabel, self.foldersGuide, self.foldersButton]) SettingsFullWidth(folders, view);
-    SettingsFullWidth(self.body, SettingsGroup(folders));
+    self.foldersGroup = SettingsGroup(folders); SettingsFullWidth(self.body, self.foldersGroup);
     NSStackView *language = SettingsStack();
     self.languageLabel = SettingsText(13, NSFontWeightMedium, NSColor.labelColor); self.languageLabel.identifier = @"interface-language-label";
     self.languagePicker = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
@@ -142,29 +159,53 @@ static NSView *SettingsGroup(NSStackView *stack) {
     self.startupStatus = SettingsText(12, NSFontWeightRegular, NSColor.secondaryLabelColor); self.startupStatus.identifier = @"startup-status";
     self.loginGuide = SettingsText(12, NSFontWeightRegular, NSColor.secondaryLabelColor);
     self.loginButton = [NSButton buttonWithTitle:@"" target:self action:@selector(permissionsAction:)]; self.loginButton.identifier = @"login-items";
-    for (NSView *view in @[self.startupToggle, self.startupStatus, self.loginGuide, self.loginButton]) SettingsFullWidth(startup, view);
+    for (NSView *view in @[self.startupToggle, self.startupStatus]) SettingsFullWidth(startup, view);
     SettingsFullWidth(self.body, SettingsGroup(startup));
 
-    self.permissionsLabel = SettingsText(15, NSFontWeightSemibold, NSColor.labelColor); SettingsFullWidth(self.body, self.permissionsLabel);
+    self.advancedDisclosure = [NSButton buttonWithTitle:@"" target:self action:@selector(toggleAdvanced:)];
+    self.advancedDisclosure.identifier = @"settings-advanced-toggle"; self.advancedDisclosure.bordered = NO;
+    self.advancedDisclosure.alignment = NSTextAlignmentLeft; self.advancedDisclosure.imagePosition = NSImageLeft;
+    SettingsFullWidth(self.body, self.advancedDisclosure);
+    self.permissionsLabel = SettingsText(15, NSFontWeightSemibold, NSColor.labelColor);
     NSStackView *permissions = SettingsStack();
     self.diskLabel = SettingsText(13, NSFontWeightMedium, NSColor.labelColor);
     self.diskGuide = SettingsText(12, NSFontWeightRegular, NSColor.secondaryLabelColor); self.diskGuide.identifier = @"full-disk-access-guide"; self.diskGuide.selectable = YES;
     self.diskButton = [NSButton buttonWithTitle:@"" target:self action:@selector(permissionsAction:)]; self.diskButton.identifier = @"full-disk-access";
     self.revealButton = [NSButton buttonWithTitle:@"" target:self action:@selector(permissionsAction:)]; self.revealButton.identifier = @"reveal-app";
-    for (NSView *view in @[self.diskLabel, self.diskGuide, self.diskButton, self.revealButton]) SettingsFullWidth(permissions, view);
-    SettingsFullWidth(self.body, SettingsGroup(permissions));
+    self.storageButton = [NSButton buttonWithTitle:@"" target:self action:@selector(showStorage:)]; self.storageButton.identifier = @"settings-storage";
+    NSMutableArray *maintenance = NSMutableArray.new;
+    for (NSString *action in @[@"reconcile", @"restart", @"diagnostics"]) {
+        NSButton *button = [NSButton buttonWithTitle:@"" target:self action:@selector(permissionsAction:)];
+        button.identifier = action; [maintenance addObject:button]; SettingsFullWidth(permissions, button);
+    }
+    self.maintenanceButtons = maintenance;
+    for (NSView *view in @[self.storageButton, self.permissionsLabel, self.diskLabel, self.diskGuide, self.diskButton, self.revealButton, self.loginGuide, self.loginButton]) SettingsFullWidth(permissions, view);
+    self.advancedContent = SettingsGroup(permissions); SettingsFullWidth(self.body, self.advancedContent);
+    self.guideButton = [NSButton buttonWithTitle:@"" target:self action:@selector(permissionsAction:)];
+    self.guideButton.identifier = @"user-guide";
+    SettingsFullWidth(self.body, self.guideButton);
     window.initialFirstResponder = self.foldersButton;
     [self.languagePicker setAccessibilityTitleUIElement:self.languageLabel]; [self.stylePicker setAccessibilityTitleUIElement:self.styleLabel];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(contentZoomChanged:) name:JasoContentZoomDidChangeNotification object:nil];
     [self reloadLocalization];
     return self;
 }
+- (NSView *)embeddedContentViewForWindow:(NSWindow *)host {
+    self.standaloneWidth.active = NO;
+    self.hostWindow = host;
+    self.foldersGroup.hidden = YES;
+    [self.window orderOut:nil];
+    return self.contentRoot;
+}
+- (NSWindow *)presentationWindow { return self.contentRoot.window ?: self.hostWindow ?: self.window; }
+- (void)toggleAdvanced:(NSButton *)sender { self.advancedExpanded = !self.advancedExpanded; [self reloadLocalization]; }
+- (void)showStorage:(NSButton *)sender { if (self.storageHandler) self.storageHandler(); }
 - (void)reloadLocalization {
     self.window.title = JasoText(@"Jaso NFC · Settings", @"Jaso NFC · 설정");
     self.headingLabel.stringValue = JasoText(@"Settings", @"설정");
-    self.foldersLabel.stringValue = JasoText(@"Folders and automatic cleanup", @"정리할 폴더와 자동 정리");
+    self.foldersLabel.stringValue = JasoText(@"Folders", @"폴더");
     self.foldersGuide.stringValue = JasoText(@"Choose folders, review proposed filename changes, and start automatic cleanup.", @"폴더를 선택하고 바뀔 파일명을 확인한 뒤 자동 정리를 시작하세요.");
-    self.foldersButton.title = JasoText(@"Manage folders…", @"정리할 폴더…");
+    self.foldersButton.title = JasoText(@"Manage folders…", @"폴더 관리…");
     self.languageLabel.stringValue = JasoText(@"Language", @"언어");
     self.explanationLabel.stringValue = JasoText(@"Applies immediately to menus and windows. Your choice is saved for the next launch.", @"선택한 언어를 메뉴와 창에 바로 적용합니다.");
     [self.languagePicker itemAtIndex:0].title = JasoText(@"System setting", @"시스템 설정");
@@ -185,8 +226,16 @@ static NSView *SettingsGroup(NSStackView *stack) {
     self.loginGuide.stringValue = JasoText(@"Allow Jaso NFC background activity in Login Items to run it after you sign in.", @"로그인 후 자동으로 실행하려면 로그인 항목에서 Jaso NFC의 백그라운드 실행을 허용하세요.");
     self.loginButton.title = JasoText(@"Open Login Items…", @"로그인 항목 열기…");
     self.permissionsLabel.stringValue = JasoText(@"Access permissions", @"접근 권한");
+    self.advancedDisclosure.title = JasoText(@"Advanced settings", @"상세 설정");
+    self.advancedDisclosure.image = [NSImage imageWithSystemSymbolName:self.advancedExpanded ? @"chevron.down" : @"chevron.right" accessibilityDescription:nil];
+    self.advancedDisclosure.accessibilityValue = @(self.advancedExpanded);
+    self.advancedContent.hidden = !self.advancedExpanded;
+    self.guideButton.title = JasoText(@"Open user guide…", @"사용 설명서 열기…");
+    self.storageButton.title = JasoText(@"Storage usage…", @"저장 공간 사용량…");
+    NSArray *maintenanceTitles = @[JasoText(@"Check folders again", @"폴더 다시 확인"), JasoText(@"Restart cleanup", @"정리 작업 다시 시작"), JasoText(@"Copy diagnostic information", @"진단 정보 복사")];
+    for (NSUInteger i = 0; i < self.maintenanceButtons.count; i++) self.maintenanceButtons[i].title = maintenanceTitles[i];
     self.diskLabel.stringValue = JasoText(@"Full Disk Access", @"전체 디스크 접근 권한");
-    self.diskGuide.stringValue = JasoText(@"Add /Applications/Jaso NFC.app with “+” and turn it on. If Open does not add it, drag the app from Finder into the list. Then choose Restart worker in Status and check for inaccessible folders.", @"‘+’를 눌러 /Applications/Jaso NFC.app을 추가하고 허용하세요. Finder에서 앱을 목록으로 끌어 넣어도 됩니다. 설정을 마친 뒤 상태 창에서 ‘작업 다시 시작’을 누르세요.");
+    self.diskGuide.stringValue = JasoText(@"Add /Applications/Jaso NFC.app with “+” and turn it on. If Open does not add it, drag the app from Finder into the list. Then choose Restart cleanup above to check the folders again.", @"‘+’를 눌러 /Applications/Jaso NFC.app을 추가하고 허용하세요. Finder에서 앱을 목록으로 끌어 넣어도 됩니다. 권한을 허용한 뒤 위의 ‘정리 작업 다시 시작’을 누르세요.");
     self.diskButton.title = JasoText(@"Open Full Disk Access…", @"전체 디스크 접근 권한 열기…");
     self.revealButton.title = JasoText(@"Show installed app in Finder", @"Finder에서 설치된 앱 보기");
     [self updateStartupEnabled:self.startupEnabled error:self.startupError busy:self.startupBusy];
@@ -220,11 +269,11 @@ static NSView *SettingsGroup(NSStackView *stack) {
 - (void)zoomIn:(id)sender { JasoSetContentZoom(self.contentZoom + .1); }
 - (void)zoomOut:(id)sender { JasoSetContentZoom(self.contentZoom - .1); }
 - (void)resetZoom:(id)sender { JasoSetContentZoom(1); }
-- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item { return JasoValidateContentZoomAction(self.window, item.action); }
+- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item { return JasoValidateContentZoomAction([self presentationWindow], item.action); }
 - (void)contentZoomChanged:(NSNotification *)notification { [self applyContentZoom]; }
 - (void)applyContentZoom {
     NSPoint previousOrigin = self.scroll.contentView.bounds.origin;
-    JasoApplyContentZoom(self.body); [self.window.contentView layoutSubtreeIfNeeded];
+    JasoApplyContentZoom(self.body); [self.contentRoot layoutSubtreeIfNeeded];
     CGFloat maximumY = MAX(0, self.body.frame.size.height - self.scroll.contentView.bounds.size.height);
     [self.scroll.contentView scrollToPoint:NSMakePoint(0, MIN(previousOrigin.y, maximumY))]; [self.scroll reflectScrolledClipView:self.scroll.contentView];
 }
@@ -235,6 +284,6 @@ static NSView *SettingsGroup(NSStackView *stack) {
     JasoSetLanguagePreference(language); [self reloadLocalization]; if (self.languageChangedHandler) self.languageChangedHandler();
 }
 - (void)permissionsAction:(NSButton *)sender { if (self.actionHandler) self.actionHandler([sender.identifier isEqual:@"setup-folders"] ? @"setup" : sender.identifier); }
-- (void)showWindow:(id)sender { [self reloadLocalization]; [super showWindow:sender]; [NSApp activateIgnoringOtherApps:YES]; [self.window makeKeyAndOrderFront:nil]; }
+- (void)showWindow:(id)sender { [self reloadLocalization]; if (!self.hostWindow) [super showWindow:sender]; [NSApp activateIgnoringOtherApps:YES]; [[self presentationWindow] makeKeyAndOrderFront:nil]; }
 - (void)windowWillClose:(NSNotification *)notification { if (self.closeHandler) self.closeHandler(); }
 @end

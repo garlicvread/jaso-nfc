@@ -88,12 +88,14 @@ static void FullWidth(NSStackView *stack, NSView *view) {
 @property NSButton *refreshButton;
 @property NSButton *primaryButton;
 @property NSButton *diagnosticsButton;
+@property NSButton *settingsButton;
 @property NSArray<NSButton *> *maintenanceButtons;
 @property BOOL workerRunning;
 @property NSTimer *refreshTimer;
 @property NSString *primaryAction;
 @property BOOL commandEnabled;
 @property BOOL busy;
+@property BOOL automaticRetriesExpanded;
 @property NSDictionary *latestSnapshot;
 @property NSString *latestError;
 @property NSDate *latestDate;
@@ -131,6 +133,10 @@ static void FullWidth(NSStackView *stack, NSView *view) {
     self.diagnosticsButton = [NSButton buttonWithTitle:SL(@"Copy diagnostics", @"진단 정보 복사") target:self action:@selector(copyDiagnostics:)];
     self.diagnosticsButton.toolTip = SL(@"Copy the current status and file paths for a support request.", @"지원 요청에 사용할 현재 상태와 파일 경로를 복사합니다.");
     NSButton *settings = [NSButton buttonWithTitle:SL(@"Settings…", @"설정…") target:self action:@selector(showSettings:)];
+    self.settingsButton = settings;
+    self.settingsButton.identifier = @"status-settings";
+    self.diagnosticsButton.identifier = @"status-diagnostics";
+    self.refreshButton.identifier = @"status-refresh";
     NSStackView *actions = Stack(@[settings, self.diagnosticsButton, self.refreshButton], NO, 12);
     actions.alignment = NSLayoutAttributeCenterY;
     NSStackView *footer = Stack(@[self.updatedLabel, actions], YES, 8);
@@ -161,6 +167,13 @@ static void FullWidth(NSStackView *stack, NSView *view) {
     return JasoValidateContentZoomAction(self.window, item.action);
 }
 - (void)contentZoomChanged:(NSNotification *)notification {
+    [self updateSnapshot:self.latestSnapshot error:self.latestError updatedAt:self.latestDate];
+}
+- (void)reloadLocalization {
+    self.window.title = SL(@"Jaso NFC · Cleanup status", @"Jaso NFC · 파일명 정리 상태");
+    self.settingsButton.title = SL(@"Settings…", @"설정…");
+    self.diagnosticsButton.title = SL(@"Copy diagnostics", @"진단 정보 복사");
+    self.diagnosticsButton.toolTip = SL(@"Copy the current status and file paths for a support request.", @"지원 요청에 사용할 현재 상태와 파일 경로를 복사합니다.");
     [self updateSnapshot:self.latestSnapshot error:self.latestError updatedAt:self.latestDate];
 }
 - (void)syncRefreshTimer {
@@ -204,6 +217,41 @@ static void FullWidth(NSStackView *stack, NSView *view) {
 - (void)revealIssue:(JasoIssueRevealButton *)sender {
     if (RevealablePath(sender.path) && self.pathHandler) self.pathHandler(sender.path);
 }
+- (void)toggleAutomaticRetries:(NSButton *)sender {
+    self.automaticRetriesExpanded = sender.state == NSControlStateValueOn;
+    [self updateSnapshot:self.latestSnapshot error:self.latestError updatedAt:self.latestDate];
+}
+- (void)appendIssues:(NSArray<NSDictionary *> *)issues toStack:(NSStackView *)stack {
+    NSUInteger displayed = 0;
+    for (NSDictionary *issue in issues) {
+        if (displayed++ == 16) break;
+        NSString *title = [issue[@"title"] isKindOfClass:NSString.class] ? issue[@"title"] : @"";
+        NSString *pathValue = [issue[@"path"] isKindOfClass:NSString.class] ? issue[@"path"] : @"";
+        NSString *detail = [issue[@"detail"] isKindOfClass:NSString.class] ? issue[@"detail"] : @"";
+        NSStackView *row = Stack(@[], YES, 7);
+        NSString *filename = pathValue.lastPathComponent;
+        if (filename.length) FullWidth(row, Text(filename, 14, NSFontWeightSemibold, NSColor.labelColor));
+        FullWidth(row, Text(title, 12, NSFontWeightSemibold, ToneColor(issue[@"tone"])));
+        if (pathValue.length) {
+            NSTextField *path = Text(pathValue, 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
+            path.identifier = @"issue-path";
+            path.lineBreakMode = NSLineBreakByCharWrapping;
+            path.toolTip = pathValue;
+            FullWidth(row, path);
+        }
+        if (detail.length) FullWidth(row, Text(detail, 12, NSFontWeightRegular, NSColor.labelColor));
+        NSString *actionTitle = [issue[@"actionTitle"] isKindOfClass:NSString.class] ? issue[@"actionTitle"] : @"";
+        if ([issue[@"action"] isEqual:@"reveal"] && RevealablePath(pathValue) && actionTitle.length) {
+            JasoIssueRevealButton *reveal = [JasoIssueRevealButton buttonWithTitle:actionTitle target:self action:@selector(revealIssue:)];
+            reveal.identifier = @"issue-reveal";
+            reveal.path = pathValue;
+            reveal.toolTip = pathValue;
+            reveal.accessibilityHelp = pathValue;
+            [row addArrangedSubview:reveal];
+        }
+        FullWidth(stack, Card(row, 16));
+    }
+}
 - (void)setRefreshing:(BOOL)refreshing {
     self.busy = refreshing;
     self.refreshButton.enabled = !refreshing;
@@ -215,6 +263,9 @@ static void FullWidth(NSStackView *stack, NSView *view) {
     }
 }
 - (void)updateSnapshot:(NSDictionary *)snapshot error:(NSString *)error updatedAt:(NSDate *)date {
+    NSResponder *focused = self.window.firstResponder;
+    BOOL restoreRetryFocus = [focused isKindOfClass:NSButton.class] && [((NSButton *)focused).identifier isEqual:@"automatic-retry-disclosure"];
+    NSButton *automaticDisclosure = nil;
     self.latestSnapshot = snapshot;
     self.latestError = error;
     self.latestDate = date;
@@ -259,45 +310,22 @@ static void FullWidth(NSStackView *stack, NSView *view) {
     FullWidth(self.body, Text(presentation[@"progressNote"], 12, NSFontWeightRegular, NSColor.secondaryLabelColor));
 
     NSArray *issues = [presentation[@"issues"] isKindOfClass:NSArray.class] ? presentation[@"issues"] : @[];
-    NSString *issueSummary = [presentation[@"issueSummary"] isKindOfClass:NSString.class] ? presentation[@"issueSummary"] : @"";
-    if (issues.count || issueSummary.length) {
-        FullWidth(self.body, Text(SL(@"File status", @"파일별 상태"), 15, NSFontWeightSemibold, nil));
-        if (issueSummary.length) {
-            NSTextField *summary = Text(issueSummary, 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
-            summary.identifier = @"issue-summary";
+    NSMutableArray *actionIssues = [NSMutableArray array], *automaticIssues = [NSMutableArray array];
+    for (id value in issues) {
+        if (![value isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *issue = value;
+        BOOL requiresAction = [issue[@"requiresAction"] isKindOfClass:NSNumber.class] && [issue[@"requiresAction"] boolValue];
+        [(requiresAction ? actionIssues : automaticIssues) addObject:issue];
+    }
+    if (actionIssues.count) {
+        FullWidth(self.body, Text(SL(@"Needs your attention", @"확인이 필요한 항목"), 15, NSFontWeightSemibold, nil));
+        NSString *detail = [presentation[@"actionIssueSummary"] isKindOfClass:NSString.class] ? presentation[@"actionIssueSummary"] : @"";
+        if (detail.length) {
+            NSTextField *summary = Text(detail, 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+            summary.identifier = @"action-issue-summary";
             FullWidth(self.body, summary);
         }
-        NSUInteger displayed = 0;
-        for (id value in issues) {
-            if (![value isKindOfClass:NSDictionary.class]) continue;
-            if (displayed++ == 16) break;
-            NSDictionary *issue = value;
-            NSString *title = [issue[@"title"] isKindOfClass:NSString.class] ? issue[@"title"] : @"";
-            NSString *pathValue = [issue[@"path"] isKindOfClass:NSString.class] ? issue[@"path"] : @"";
-            NSString *detail = [issue[@"detail"] isKindOfClass:NSString.class] ? issue[@"detail"] : @"";
-            NSStackView *row = Stack(@[], YES, 7);
-            NSString *filename = pathValue.lastPathComponent;
-            if (filename.length) FullWidth(row, Text(filename, 14, NSFontWeightSemibold, NSColor.labelColor));
-            FullWidth(row, Text(title, 12, NSFontWeightSemibold, ToneColor(issue[@"tone"])));
-            if (pathValue.length) {
-                NSTextField *path = Text(pathValue, 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
-                path.identifier = @"issue-path";
-                path.lineBreakMode = NSLineBreakByCharWrapping;
-                path.toolTip = pathValue;
-                FullWidth(row, path);
-            }
-            if (detail.length) FullWidth(row, Text(detail, 12, NSFontWeightRegular, NSColor.labelColor));
-            NSString *actionTitle = [issue[@"actionTitle"] isKindOfClass:NSString.class] ? issue[@"actionTitle"] : @"";
-            if ([issue[@"action"] isEqual:@"reveal"] && RevealablePath(pathValue) && actionTitle.length) {
-                JasoIssueRevealButton *reveal = [JasoIssueRevealButton buttonWithTitle:actionTitle target:self action:@selector(revealIssue:)];
-                reveal.identifier = @"issue-reveal";
-                reveal.path = pathValue;
-                reveal.toolTip = pathValue;
-                reveal.accessibilityHelp = pathValue;
-                [row addArrangedSubview:reveal];
-            }
-            FullWidth(self.body, Card(row, 16));
-        }
+        [self appendIssues:actionIssues toStack:self.body];
     }
 
     NSArray *notices = presentation[@"notices"];
@@ -335,6 +363,35 @@ static void FullWidth(NSStackView *stack, NSView *view) {
         FullWidth(locations, row);
     }
     FullWidth(self.body, Card(locations, 16));
+    NSString *automaticSummary = [presentation[@"automaticRetrySummary"] isKindOfClass:NSString.class] ? presentation[@"automaticRetrySummary"] : @"";
+    if (automaticSummary.length) {
+        NSStackView *automaticGroup = Stack(@[], YES, 14);
+        automaticGroup.identifier = @"automatic-retry-group";
+        NSButton *disclosure = [NSButton buttonWithTitle:automaticSummary target:self action:@selector(toggleAutomaticRetries:)];
+        automaticDisclosure = disclosure;
+        disclosure.identifier = @"automatic-retry-disclosure";
+        [disclosure setButtonType:NSButtonTypePushOnPushOff];
+        disclosure.bordered = NO;
+        disclosure.alignment = NSTextAlignmentLeft;
+        disclosure.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+        disclosure.contentTintColor = NSColor.secondaryLabelColor;
+        disclosure.image = [NSImage imageWithSystemSymbolName:self.automaticRetriesExpanded ? @"chevron.down" : @"chevron.right" accessibilityDescription:nil];
+        disclosure.imagePosition = NSImageLeft;
+        disclosure.imageHugsTitle = YES;
+        disclosure.state = self.automaticRetriesExpanded ? NSControlStateValueOn : NSControlStateValueOff;
+        disclosure.accessibilityHelp = SL(@"Show or hide the items scheduled for another automatic attempt.", @"자동 재시도 항목의 상세 정보를 펼치거나 접습니다.");
+        FullWidth(automaticGroup, disclosure);
+        if (self.automaticRetriesExpanded) {
+            NSString *detail = [presentation[@"automaticRetryDetail"] isKindOfClass:NSString.class] ? presentation[@"automaticRetryDetail"] : @"";
+            if (detail.length) {
+                NSTextField *summary = Text(detail, 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+                summary.identifier = @"automatic-retry-detail";
+                FullWidth(automaticGroup, summary);
+            }
+            [self appendIssues:automaticIssues toStack:automaticGroup];
+        }
+        FullWidth(self.body, automaticGroup);
+    }
     FullWidth(self.body, Text(SL(@"Maintenance", @"작업 관리"), 15, NSFontWeightSemibold, nil));
     NSStackView *maintenance = Stack(@[], YES, 10);
     FullWidth(maintenance, Text(SL(@"Recheck folders, restart cleanup after changing permissions, or open recovery history. Your login startup preference stays saved when you stop cleanup.", @"폴더를 다시 확인하거나 권한 변경 후 작업을 다시 시작하고, 복구 기록을 열어 보세요. 작업을 중지하면 로그인 실행 선택은 저장된 상태로 유지합니다."), 12, NSFontWeightRegular, NSColor.secondaryLabelColor));
@@ -363,5 +420,6 @@ static void FullWidth(NSStackView *stack, NSView *view) {
     CGFloat maximumY = MAX(0, self.body.frame.size.height - self.scroll.contentView.bounds.size.height);
     [self.scroll.contentView scrollToPoint:NSMakePoint(0, MIN(previousOrigin.y, maximumY))];
     [self.scroll reflectScrolledClipView:self.scroll.contentView];
+    if (restoreRetryFocus && automaticDisclosure) [self.window makeFirstResponder:automaticDisclosure];
 }
 @end

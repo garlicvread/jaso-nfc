@@ -1,8 +1,9 @@
 //! App setup: an editable draft, an observation-only preview, and a locked reload.
 use crate::{
-    config::Config,
+    config::{Config, DrivePreferences},
     control,
     directory_io::{self, CancellationScope},
+    filename_repair::entry_target,
     normalizer::Normalizer,
     policy::{Policy, absolute, nfc},
     sources,
@@ -29,6 +30,8 @@ pub struct Draft {
     pub roots: Vec<String>,
     pub excludes: Vec<String>,
     pub apply: bool,
+    #[serde(default)]
+    pub drives: DrivePreferences,
 }
 impl From<&Config> for Draft {
     fn from(config: &Config) -> Self {
@@ -37,6 +40,7 @@ impl From<&Config> for Draft {
             roots: config.roots.clone(),
             excludes: config.excludes.clone(),
             apply: config.apply,
+            drives: config.drives.clone(),
         }
     }
 }
@@ -52,10 +56,6 @@ impl Draft {
         ensure!(
             matches!(self.scope.as_str(), "configured" | "all-user-files"),
             "Choose selected folders or all user files."
-        );
-        ensure!(
-            self.scope != "configured" || !self.roots.is_empty(),
-            "Choose at least one folder."
         );
         ensure!(
             self.scope != "all-user-files" || self.roots.is_empty(),
@@ -78,6 +78,7 @@ impl Draft {
         config.roots = self.roots.clone();
         config.excludes = self.excludes.clone();
         config.apply = self.apply;
+        config.drives = self.drives.clone();
         config.validate()?;
         Ok(config)
     }
@@ -110,11 +111,45 @@ fn revision(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn drive_inventory(config: &Config) -> sources::DriveInventory {
+    let deadline = match PreviewDeadline::new(Duration::from_secs(5)) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            return sources::unavailable_drive_inventory(
+                config,
+                format!("Cannot check mounted drives: {error:#}"),
+            );
+        }
+    };
+    let _cancellation = CancellationScope::new(deadline.cancelled.clone());
+    sources::drive_inventory(config)
+}
+
 pub fn read(path: &Path) -> Result<Value> {
+    read_with_inventory(path, drive_inventory)
+}
+fn read_with_inventory(
+    path: &Path,
+    collect: impl FnOnce(&Config) -> sources::DriveInventory,
+) -> Result<Value> {
     let saved = Saved::read(path)?;
+    let inventory = collect(&saved.config);
     Ok(
         json!({"config":Draft::from(&saved.config),"revision":saved.revision,
-        "running":control::running(&saved.config)?,"paused":control::paused(&saved.config)?}),
+        "running":control::running(&saved.config)?,"paused":control::paused(&saved.config)?,
+        "drive_inventory":inventory.items,"drive_inventory_issues":inventory.issues,
+        "drive_inventory_complete":inventory.complete}),
+    )
+}
+
+pub fn start_drive(path: &Path, uuid: &str, expected_revision: &str) -> Result<Value> {
+    let saved = Saved::read(path)?;
+    check_revision(&saved, expected_revision)?;
+    let deadline = PreviewDeadline::new(Duration::from_secs(5))?;
+    let _cancellation = CancellationScope::new(deadline.cancelled.clone());
+    sources::request_drive_start(&saved.config, uuid)?;
+    Ok(
+        json!({"uuid":uuid,"ready":true,"running":control::running(&saved.config)?,"paused":control::paused(&saved.config)?}),
     )
 }
 
@@ -284,7 +319,10 @@ fn preview_with_limits(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            let after = nfc(name);
+            let after = entry_target(
+                name,
+                entry.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32,
+            );
             if after != name
                 && !config
                     .roots
@@ -414,6 +452,7 @@ fn acknowledged(config: &Config, path: &Path) -> Result<bool> {
         .as_i64()
         .filter(|pid| *pid > 0 && *pid <= i32::MAX as i64);
     Ok(value["config_signature"] == config.signature()
+        && value["runtime_signature"] == config.runtime_signature()
         && value["config_path"] == path.to_string_lossy().as_ref()
         && pid.is_some_and(|pid| unsafe { libc::kill(pid as i32, 0) } == 0))
 }
@@ -431,6 +470,7 @@ impl RuntimeReady {
         crate::config::atomic_json(
             &path,
             &json!({"pid":std::process::id(),"config_signature":config.signature(),
+            "runtime_signature":config.runtime_signature(),
             "config_path":config_path,"instance":instance}),
         )?;
         Ok(Self { path, instance })
@@ -514,6 +554,9 @@ fn save_with(
     let saved = Saved::read(path)?;
     check_revision(&saved, expected_revision)?;
     let config = draft.merge(&saved.config)?;
+    // Inventory is advisory. Identity failures must not discard an otherwise
+    // valid folder draft; drive execution still requires verified identities.
+    let drive_inventory = drive_inventory(&config);
     ensure!(
         !start || config.apply,
         "Choose automatic cleanup before starting it."
@@ -640,8 +683,15 @@ fn save_with(
         }
         return Err(error);
     }
+    if let Err(error) = crate::retention::mark_completed(&backup)
+        .and_then(|_| crate::retention::prune_backups(Path::new(&config.state_dir)))
+    {
+        crate::service::diagnostic(&config, &format!("settings backup retention: {error:#}"));
+    }
     Ok(
-        json!({"config":Draft::from(&config),"revision":revision(&bytes),"started":should_run,"paused":desired_pause}),
+        json!({"config":Draft::from(&config),"revision":revision(&bytes),"started":should_run,"paused":desired_pause,
+        "drive_inventory":drive_inventory.items,"drive_inventory_issues":drive_inventory.issues,
+        "drive_inventory_complete":drive_inventory.complete}),
     )
 }
 
@@ -650,6 +700,88 @@ mod tests {
     use super::*;
     use crate::lifecycle::LaunchHost;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn folder_read_preserves_editable_draft_when_drive_inventory_is_unavailable() {
+        let fixture = Fixture::new();
+        let result = read_with_inventory(&fixture.path, |config| {
+            sources::unavailable_drive_inventory(
+                config,
+                "Cannot list mounted drives: Operation canceled".into(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            result["config"],
+            serde_json::to_value(Draft::from(&fixture.saved)).unwrap()
+        );
+        assert_eq!(result["revision"], revision(&fixture.original));
+        assert_eq!(result["paused"], true);
+        assert_eq!(result["drive_inventory_complete"], false);
+        assert!(result["drive_inventory"].is_array());
+        assert_eq!(result["drive_inventory_issues"][0]["mount"], "/Volumes");
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.original);
+    }
+
+    #[test]
+    fn legacy_draft_defaults_to_automatic_drives() {
+        let draft = Draft::parse(
+            r#"{"scope":"configured","roots":["/tmp/files"],"excludes":[],"apply":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&draft).unwrap()["drives"],
+            json!({"mode":"automatic", "included":[], "excluded":[]})
+        );
+    }
+
+    #[test]
+    fn drive_choices_survive_setup_read_save_and_draft_conversion() {
+        let mut fixture = Fixture::new();
+        let choices = json!({"mode":"selected", "included":[{"uuid":"offline-setup-test", "mount":"/Volumes/Offline Photos"}], "excluded":[]});
+        let mut value = serde_json::to_value(&fixture.draft).unwrap();
+        value["drives"] = choices.clone();
+        fixture.draft = Draft::parse(&value.to_string()).unwrap();
+        let result = fixture.save(false).unwrap();
+        assert_eq!(result["config"]["drives"], choices);
+        assert!(result["drive_inventory"].is_array());
+        let saved = Config::load(&fixture.path).unwrap();
+        assert_eq!(
+            serde_json::to_value(Draft::from(&saved)).unwrap()["drives"],
+            choices
+        );
+        let read_result = read(&fixture.path).unwrap();
+        assert_eq!(read_result["config"]["drives"], choices);
+        assert_eq!(read_result["revision"], result["revision"]);
+        assert!(
+            read_result["drive_inventory"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["uuid"] == "offline-setup-test"
+                    && item["included"] == true
+                    && item["connected"] == false)
+        );
+    }
+
+    #[test]
+    fn runtime_acknowledgement_requires_matching_drive_choices() {
+        let fixture = Fixture::new();
+        let _lock = control::RuntimeLock::acquire(&fixture.saved, Duration::ZERO).unwrap();
+        let old_ready = RuntimeReady::publish(&fixture.saved, Some(&fixture.path)).unwrap();
+        assert!(acknowledged(&fixture.saved, &fixture.path).unwrap());
+        let mut value = serde_json::to_value(&fixture.saved).unwrap();
+        value["drives"] = json!({"mode":"selected", "included":[], "excluded":[]});
+        let mut changed: Config = serde_json::from_value(value).unwrap();
+        changed.validate().unwrap();
+        assert_eq!(changed.signature(), fixture.saved.signature());
+        assert!(!acknowledged(&changed, &fixture.path).unwrap());
+        let current_ready = RuntimeReady::publish(&changed, Some(&fixture.path)).unwrap();
+        drop(old_ready);
+        assert!(acknowledged(&changed, &fixture.path).unwrap());
+        drop(current_ready);
+        assert!(!acknowledged(&changed, &fixture.path).unwrap());
+    }
 
     struct FakeHost {
         config: PathBuf,
@@ -846,6 +978,29 @@ mod tests {
         );
     }
     #[test]
+    fn removing_last_configured_folder_saves_and_previews_an_idle_configuration() {
+        let mut f = Fixture::new();
+        f.draft = Draft::from(&f.saved);
+        f.draft.roots.clear();
+        f.draft.drives.excluded.push(crate::config::DriveReference {
+            uuid: "removed-offline-drive".into(),
+            mount: "/Volumes/Offline Media".into(),
+        });
+        let result = f.save(false).unwrap();
+        let reloaded = Config::load(&f.path).unwrap();
+        assert_eq!(reloaded.scope, "configured");
+        assert!(reloaded.roots.is_empty());
+        assert_eq!(reloaded.apply, f.saved.apply);
+        assert_eq!(reloaded.excludes, f.saved.excludes);
+        assert_eq!(reloaded.drives, f.draft.drives);
+        assert_eq!(result["paused"], true);
+        assert!(f.host.loaded && f.host.disabled);
+        let preview = preview(&f.path, &Draft::from(&reloaded)).unwrap();
+        assert_eq!(preview["complete"], true);
+        assert_eq!(preview["entries"], 0);
+        assert_eq!(preview["candidates"], json!([]));
+    }
+    #[test]
     fn save_without_start_preserves_paused_and_stopped_choices() {
         let mut f = Fixture::new();
         let result = f.save(false).unwrap();
@@ -916,6 +1071,29 @@ mod tests {
         assert_eq!(std::fs::read(&f.path).unwrap(), b"{}\n");
     }
     #[test]
+    fn stale_drive_start_never_writes_a_permission_or_changes_control() {
+        let f = Fixture::new();
+        assert!(
+            start_drive(&f.path, "selected-drive", "stale")
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        assert!(
+            !Config::load(&f.path)
+                .unwrap()
+                .state_path("drive-start-signal.json")
+                .exists()
+        );
+        assert!(
+            !Config::load(&f.path)
+                .unwrap()
+                .state_path("drive-starts")
+                .exists()
+        );
+        f.unchanged();
+    }
+    #[test]
     fn preview_retains_cancelled_checks_recorded_before_a_later_deadline() {
         let cancelled = json!({"path":"/already-checked","error":format!("metadata: {}", std::io::Error::from_raw_os_error(libc::ECANCELED))});
         let genuine: Vec<Value> = [libc::EACCES, libc::ENOENT, libc::ETIMEDOUT]
@@ -983,6 +1161,34 @@ mod tests {
         assert_eq!(result["truncated"], true);
         assert_eq!(result["complete"], true);
         assert_eq!(std::fs::read(&f.path).unwrap(), f.original);
+    }
+
+    #[test]
+    fn encoding_repair_preview_matches_the_automatic_target_without_mutating() {
+        let f = Fixture::new();
+        let before = "µµÀüÀÇ IRÆ÷½ºÅÍ-ÃÖÁ¾º».pdf";
+        let source = Path::new(&f.saved.roots[0]).join(before);
+        std::fs::write(&source, b"preview fixture").unwrap();
+        let result =
+            preview_with_limits(&f.path, &f.draft, 10, 100, Duration::from_secs(2)).unwrap();
+        let rows = result["candidates"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["before"], before);
+        assert_eq!(rows[0]["after"], "도전의 IR포스터-최종본.pdf");
+        assert_eq!(std::fs::read(&source).unwrap(), b"preview fixture");
+        assert_eq!(std::fs::read(&f.path).unwrap(), f.original);
+    }
+
+    #[test]
+    fn encoding_repair_preview_leaves_directories_and_symlinks_unchanged() {
+        let f = Fixture::new();
+        let root = Path::new(&f.saved.roots[0]);
+        let before = "µµÀüÀÇ IRÆ÷½ºÅÍ-ÃÖÁ¾º».pdf";
+        std::fs::create_dir(root.join(before)).unwrap();
+        std::os::unix::fs::symlink("missing-target", root.join(format!("link {before}"))).unwrap();
+        let result =
+            preview_with_limits(&f.path, &f.draft, 10, 100, Duration::from_secs(2)).unwrap();
+        assert_eq!(result["candidates"], json!([]));
     }
 
     #[test]

@@ -50,64 +50,93 @@ static NSDictionary *Notice(NSString *title, NSString *detail, NSString *tone) {
 
 static BOOL HasError(NSString *reason, int code) {
     // Match serialized errors, not numbers or error-like text inside a path.
+    if (reason.isAbsolutePath || [reason hasPrefix:@"file:"]) return NO;
     return [reason isEqual:[NSString stringWithFormat:@"%d", code]] ||
         [reason hasPrefix:[NSString stringWithFormat:@"[Errno %d]", code]] ||
         [reason hasSuffix:[NSString stringWithFormat:@"(os error %d)", code]];
 }
 
+// Classification is shared by current retry advice and historical observations.
+// Only the former may recommend a next action or promise an automatic retry.
+static NSString *FailureCategory(NSString *path, NSString *reason, BOOL locked) {
+    BOOL cloud = [path containsString:@"/Library/CloudStorage/"] || [path containsString:@"/Library/Mobile Documents/"];
+    BOOL authentication = HasError(reason, EAUTH) || HasError(reason, ENEEDAUTH);
+    if ([reason isEqual:@"dataless-file"] || [reason isEqual:@"dataless file deferred; download state is not verified"]) return @"cloud-only";
+    if (locked && !authentication) return @"locked";
+    if (authentication) return @"authentication";
+    if (cloud && HasError(reason, EPERM)) return @"cloud-refused";
+    if (HasError(reason, EACCES) || HasError(reason, EPERM)) return @"permission";
+    if (HasError(reason, EEXIST)) return @"conflict";
+    if (HasError(reason, EROFS)) return @"readonly";
+    if (HasError(reason, ENOSPC) || ([reason hasPrefix:@"Critical storage: fewer than "] && [reason containsString:@" MiB available for "])) return @"storage";
+    if (HasError(reason, EINTR)) return @"interrupted";
+    if (HasError(reason, ETIMEDOUT)) return @"timeout";
+    if (HasError(reason, EBUSY) || HasError(reason, EAGAIN) || HasError(reason, EDEADLK)) return @"busy";
+    if (HasError(reason, ENOENT) || HasError(reason, ENODEV)) return @"unavailable";
+    return @"retry";
+}
+
 static NSDictionary *FailureAdvice(NSString *path, id savedReason, BOOL locked, BOOL repeated, BOOL korean) {
     NSString *reason = [savedReason isKindOfClass:NSString.class] ? savedReason : @"";
     BOOL cloud = [path containsString:@"/Library/CloudStorage/"] || [path containsString:@"/Library/Mobile Documents/"];
-    BOOL authentication = HasError(reason, EAUTH) || HasError(reason, ENEEDAUTH);
+    NSString *cause = FailureCategory(path, reason, locked);
     NSString *category = @"retry";
     NSString *title = Text(korean, @"Waiting for another attempt", @"다시 시도할 때까지 보류");
     NSString *detail = Text(korean, @"The cause is not yet known. Cleanup will retry automatically. If this keeps happening, open the location in Finder and check whether the item is accessible.", @"원인은 아직 확인되지 않았습니다. 자동으로 재시도합니다. 계속되면 Finder에서 이 위치를 열어 항목에 접근할 수 있는지 확인하세요.");
     BOOL required = NO;
-    if (locked && !authentication) {
+    if ([cause isEqual:@"cloud-only"]) {
+        category = @"cloud-only";
+        title = Text(korean, @"Stored in the cloud", @"클라우드에 보관 중");
+        detail = Text(korean, @"Filename cleanup resumes when the file is available on this Mac.", @"이 Mac에 파일이 저장되면 이름을 정리합니다.");
+    } else if ([cause isEqual:@"locked"]) {
         category = @"locked";
         title = cloud ? Text(korean, @"Cloud item is locked", @"클라우드 항목 잠금으로 보류") : Text(korean, @"Check the file or folder lock", @"파일 또는 폴더 잠금 확인");
         detail = cloud
             ? Text(korean, @"The file or its parent folder was locked at the last attempt. Wait for the sync app to release its managed lock. If this persists, check the sync app and the item in Finder.", @"마지막 시도에서 파일 또는 상위 폴더가 잠겨 있었습니다. 동기화 앱이 관리하는 잠금은 해당 앱이 해제할 때까지 기다려 주세요. 계속되면 동기화 앱과 Finder에서 항목 상태를 확인하세요.")
             : Text(korean, @"The file or its parent folder was locked at the last attempt. In Finder → Get Info, check Locked. You can change a lock you set yourself; let the owning app release any lock it manages.", @"마지막 시도에서 파일 또는 상위 폴더가 잠겨 있었습니다. Finder → 정보 가져오기에서 ‘잠김’을 확인하세요. 직접 설정한 잠금은 변경할 수 있으며, 앱이 관리하는 잠금은 해당 앱이 해제할 때까지 기다려 주세요.");
         required = !cloud;
-    } else if (authentication) {
+    } else if ([cause isEqual:@"authentication"]) {
         category = @"authentication"; required = YES;
         title = Text(korean, @"Check account authentication", @"계정 인증 확인 필요");
         detail = cloud
             ? Text(korean, @"The last check reported an authentication problem. Open the sync app and check this account's current sign-in and connection messages. Follow its instructions to restore access; cleanup will then check the location again.", @"마지막 확인에서 인증 오류가 발생했습니다. 동기화 앱에서 해당 계정의 현재 로그인·연결 안내를 확인하세요. 앱의 안내에 따라 접근을 복구하면 이 위치를 다시 확인합니다.")
             : Text(korean, @"The last check reported an authentication problem. In Finder or the service app, check the current sign-in and connection messages for the account used here. Follow its instructions to restore access; cleanup will then check this location again.", @"마지막 확인에서 인증 오류가 발생했습니다. Finder 또는 해당 서비스 앱에서 이 위치에 연결하는 계정의 현재 로그인·연결 안내를 확인하세요. 안내에 따라 접근을 복구하면 이 위치를 다시 확인합니다.");
-    } else if (cloud && HasError(reason, EPERM)) {
+    } else if ([cause isEqual:@"cloud-refused"]) {
         // A cloud rename can also leave a directory retry without its saved
         // lock signature. EPERM alone does not identify the cause.
         title = Text(korean, @"Cloud operation was not permitted", @"클라우드 작업이 허용되지 않음");
         detail = Text(korean, @"The cause is not yet known. Wait for syncing to finish; cleanup will retry automatically. If this persists, check the sync app and open the item in Finder.", @"원인은 아직 확인되지 않았습니다. 동기화가 끝날 때까지 기다려 주세요. 자동으로 재시도합니다. 계속되면 동기화 앱을 확인하고 Finder에서 항목을 열어 보세요.");
-    } else if (HasError(reason, EACCES) || HasError(reason, EPERM)) {
+    } else if ([cause isEqual:@"permission"]) {
         category = @"permission"; required = YES;
         title = Text(korean, @"Check access permissions", @"접근 권한 확인 필요");
         detail = Text(korean, @"In Finder → Get Info, check Sharing & Permissions and the lock for this item and its parent folder. For protected folders, also check Full Disk Access in Settings. Each of these controls can affect access.", @"Finder → 정보 가져오기에서 이 항목과 상위 폴더의 ‘공유 및 사용 권한’과 잠금을 확인하세요. 보호된 폴더라면 설정의 전체 디스크 접근 권한도 확인하세요. 각각의 설정이 접근에 영향을 줄 수 있습니다.");
-    } else if (HasError(reason, EEXIST)) {
+    } else if ([cause isEqual:@"conflict"]) {
         category = @"conflict"; required = YES;
         title = Text(korean, @"Resolve a filename conflict", @"파일 이름 충돌 확인 필요");
         detail = Text(korean, @"Another item already uses the proposed name, so this rename was deferred. Open the folder in Finder, compare the two items, and give one a distinct name if needed. Cleanup will retry afterward.", @"정리 후 이름을 다른 항목이 사용하고 있어 이번 이름 변경을 보류했습니다. Finder에서 폴더를 열어 두 항목을 비교하고, 필요한 경우 하나를 다른 이름으로 바꾸세요. 이후 자동으로 재시도합니다.");
-    } else if (HasError(reason, EROFS)) {
+    } else if ([cause isEqual:@"readonly"]) {
         category = @"readonly"; required = YES;
         title = Text(korean, @"Location is read-only", @"읽기 전용 위치");
         detail = Text(korean, @"This location is read-only. Use a copy in a writable location, or check the drive's write access in Finder.", @"이 위치는 읽기 전용입니다. 쓰기 가능한 위치의 사본을 사용하거나 Finder에서 드라이브의 쓰기 권한을 확인하세요.");
-    } else if (HasError(reason, EINTR)) {
+    } else if ([cause isEqual:@"storage"]) {
+        category = @"storage"; required = YES;
+        title = Text(korean, @"Insufficient disk space", @"디스크 여유 공간 부족");
+        detail = Text(korean, @"The operation reported insufficient free disk space. Check Storage in Settings and free up space before trying again.", @"작업에서 디스크 여유 공간 부족이 확인되었습니다. 설정에서 저장 공간을 확인하고 여유 공간을 확보한 뒤 다시 시도해 주세요.");
+    } else if ([cause isEqual:@"interrupted"]) {
         category = @"interrupted";
         title = Text(korean, @"Check interrupted — automatic retry", @"확인 중단 · 자동 재시도");
         detail = Text(korean, @"The folder check was interrupted before it finished. Cleanup will retry automatically.", @"폴더 확인 도중 작업이 중단되었습니다. 자동으로 재시도합니다.");
-    } else if (HasError(reason, ETIMEDOUT)) {
+    } else if ([cause isEqual:@"timeout"]) {
         category = @"timeout";
         title = Text(korean, @"Response timed out — automatic retry", @"응답 시간 초과 · 자동 재시도");
         detail = cloud
             ? Text(korean, @"The last check timed out; the cause is still unknown. Other folders can continue processing; this one will retry automatically. If this repeats, check this account's connection in the sync app and open the folder in Finder.", @"마지막 확인에서 응답 시간이 초과되었으며 원인은 아직 알 수 없습니다. 다른 폴더는 계속 처리하며 이 위치는 자동으로 재시도합니다. 반복되면 동기화 앱에서 해당 계정의 연결 상태를 확인하고 Finder에서 이 폴더를 열어 보세요.")
             : Text(korean, @"This location took too long to respond. Other folders can continue processing; this one will retry automatically. If this repeats, check the drive or network connection.", @"이 위치의 응답 시간이 초과되었습니다. 다른 폴더는 계속 처리하며 이 위치는 자동으로 재시도합니다. 반복되면 드라이브나 네트워크 연결을 확인하세요.");
-    } else if (HasError(reason, EBUSY) || HasError(reason, EAGAIN) || HasError(reason, EDEADLK)) {
+    } else if ([cause isEqual:@"busy"]) {
         category = @"busy";
         title = Text(korean, @"Temporarily busy — automatic retry", @"일시적으로 사용 중 · 자동 재시도");
         detail = Text(korean, @"This item was temporarily busy at the last attempt. Cleanup will retry automatically. For cloud files, wait for syncing to finish. If this repeats, try opening the item in Finder.", @"마지막 시도에서 이 항목을 일시적으로 사용할 수 없었습니다. 자동으로 재시도합니다. 클라우드 파일은 동기화가 끝날 때까지 기다려 주세요. 반복되면 Finder에서 항목을 열어 보세요.");
-    } else if (HasError(reason, ENOENT) || HasError(reason, ENODEV)) {
+    } else if ([cause isEqual:@"unavailable"]) {
         category = @"unavailable";
         title = Text(korean, @"Waiting for the location to return", @"위치를 다시 사용할 때까지 대기");
         detail = Text(korean, @"The item or drive was unavailable at the last attempt. Reconnect it if needed, or wait for cloud syncing. Cleanup will check it again automatically.", @"마지막 시도에서 항목이나 드라이브를 사용할 수 없었습니다. 필요한 경우 다시 연결하거나 클라우드 동기화를 기다려 주세요. 자동으로 다시 확인합니다.");
@@ -123,6 +152,147 @@ static NSDictionary *FailureAdvice(NSString *path, id savedReason, BOOL locked, 
             : Text(korean, @"Several attempts have failed. Open this location in Finder and check the drive or network connection.", @"여러 차례 시도한 뒤에도 실패했습니다. Finder에서 이 위치를 열어 보고 드라이브나 네트워크 연결을 확인하세요.")];
     }
     return @{@"title":title, @"detail":detail, @"requiresAction":@(required), @"category":category};
+}
+
+static NSString *ActivityPhaseTitle(NSString *phase, BOOL korean) {
+    NSDictionary *names=@{
+        @"starting":Text(korean, @"Starting cleanup",@"정리를 시작하고 있습니다"),
+        @"discovering_sources":Text(korean, @"Checking selected locations",@"선택한 위치 확인 중"),
+        @"opening_directory":Text(korean, @"Opening folder metadata",@"폴더 정보 확인 중"),
+        @"reading_metadata":Text(korean, @"Checking file metadata",@"파일 정보 확인 중"),
+        @"processing":Text(korean, @"Checking a file name",@"파일 이름 확인 중"),
+        @"normalizing":Text(korean, @"Checking a file name",@"파일 이름 확인 중"),
+        @"directory_read":Text(korean, @"Reading folder metadata",@"폴더 목록 확인 중"),
+        @"enumerating":Text(korean, @"Reading folder metadata",@"폴더 목록 확인 중"),
+        @"scanning":Text(korean, @"Checking file names",@"파일 이름 확인 중"),
+        @"metadata":Text(korean, @"Checking metadata",@"파일 정보 확인 중"),
+        @"observation":Text(korean, @"Checking a file",@"파일 확인 중"),
+        @"renamed":Text(korean, @"Name changed",@"이름 변경 완료"),
+        @"restored":Text(korean, @"Original name restored",@"원래 이름으로 되돌림 완료"),
+        @"deferred":Text(korean, @"Will check again",@"다시 확인할 항목"),
+        @"error":Text(korean, @"Could not complete this check",@"검사를 마치지 못한 항목"),
+        @"renaming":Text(korean, @"Renaming a file",@"파일 이름 변경 중"),
+        @"restoring":Text(korean, @"Restoring the original name",@"원래 이름으로 되돌리는 중"),
+        @"checking_storage":Text(korean, @"Checking available disk space",@"디스크 여유 공간 확인 중"),
+        @"updating_history":Text(korean, @"Updating change history",@"변경 기록 갱신 중"),
+        @"low_storage":Text(korean, @"Cleanup is waiting for disk space",@"디스크 공간 확보를 기다리고 있습니다"),
+        @"waiting_for_events":Text(korean, @"Ready for new files",@"새 파일을 확인할 준비가 됐습니다"),
+        @"idle":Text(korean, @"Ready for new files",@"새 파일을 확인할 준비가 됐습니다"),
+        @"paused":Text(korean, @"Paused",@"일시 정지"),
+        @"stopping":Text(korean, @"Stopping cleanup",@"정리를 중지하는 중"),
+        @"stopped":Text(korean, @"Cleanup is stopped",@"정리가 중지되었습니다"),
+        @"recovering":Text(korean, @"Checking an interrupted change",@"중단된 이름 변경 확인 중")
+    };
+    return names[phase]?:Text(korean, @"Activity details unavailable",@"활동 내용을 확인할 수 없습니다");
+}
+
+static NSNumber *ActivityErrno(id value) {
+    if (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) return nil;
+    double number = [value doubleValue];
+    return isfinite(number) && floor(number) == number && number >= INT32_MIN && number <= INT32_MAX ? value : nil;
+}
+
+static NSNumber *ActivityTimestamp(id value) {
+    if (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) return nil;
+    double number = [value doubleValue];
+    return isfinite(number) && number > 0 && number <= NSDate.distantFuture.timeIntervalSince1970 ? value : nil;
+}
+
+static NSString *ActivityTime(NSNumber *value, BOOL korean) {
+    NSDateFormatter *formatter = [NSDateFormatter new];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:korean ? @"ko_KR" : @"en_US"];
+    formatter.dateStyle = NSDateFormatterShortStyle;
+    formatter.timeStyle = NSDateFormatterMediumStyle;
+    return [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:value.doubleValue]];
+}
+
+NSDictionary *JasoActivityPresentation(NSDictionary *event, BOOL korean) {
+    event = Dictionary(event);
+    NSString *kind = [event[@"kind"] isKindOfClass:NSString.class] ? event[@"kind"] : @"";
+    NSString *phase = [event[@"phase"] isKindOfClass:NSString.class] ? event[@"phase"] : @"";
+    NSString *path = [event[@"path"] isKindOfClass:NSString.class] ? event[@"path"] : @"";
+    BOOL historicalIssue = [@[@"error", @"deferred", @"waiting", @"wait"] containsObject:kind];
+    BOOL safePath = path.isAbsolutePath && [path rangeOfString:@"\0"].location == NSNotFound &&
+        ![path.pathComponents containsObject:@".."] && ![path.pathComponents containsObject:@"."] &&
+        ![path hasSuffix:@"…"] && ![Flag(event[@"path_truncated"]) boolValue];
+    // Unknown truncation metadata cannot establish a safe identity either.
+    if (event[@"path_truncated"] && event[@"path_truncated"] != NSNull.null && !Flag(event[@"path_truncated"])) safePath = NO;
+    NSString *title = ActivityPhaseTitle([@[@"renamed", @"restored"] containsObject:kind] ? kind : phase, korean);
+    NSString *detail = Text(korean, @"This records the activity at the time shown.", @"표시된 시각에 기록된 활동입니다.");
+    NSString *category = @"activity";
+    if (historicalIssue) {
+        NSString *reason = [event[@"reason"] isKindOfClass:NSString.class] ? event[@"reason"] : @"";
+        NSNumber *error = ActivityErrno(event[@"errno"]);
+        category = FailureCategory(path, error ? error.stringValue : reason, NO);
+        NSDictionary *titles = @{
+            @"cloud-only":Text(korean, @"Stored in the cloud", @"클라우드에 보관 중"),
+            @"permission":Text(korean, @"Access was denied", @"접근 권한 오류"),
+            @"authentication":Text(korean, @"Account authentication failed", @"계정 인증 오류"),
+            @"cloud-refused":Text(korean, @"Cloud operation was not permitted", @"클라우드 작업이 허용되지 않음"),
+            @"conflict":Text(korean, @"Rename deferred by a filename conflict", @"이름 충돌로 변경 보류"),
+            @"readonly":Text(korean, @"Change blocked by a read-only location", @"읽기 전용 위치로 변경 보류"),
+            @"storage":Text(korean, @"Insufficient disk space", @"디스크 여유 공간 부족"),
+            @"interrupted":Text(korean, @"Check was interrupted", @"검사 도중 중단"),
+            @"timeout":Text(korean, @"Response timed out", @"응답 시간 초과"),
+            @"busy":Text(korean, @"Item was temporarily busy", @"당시 항목을 일시적으로 사용할 수 없었음"),
+            @"unavailable":Text(korean, @"Item or location was unavailable", @"당시 항목 또는 위치를 사용할 수 없었음")};
+        NSDictionary *details = @{
+            @"cloud-only":Text(korean, @"At this check, the file was stored in the cloud. Its availability on this Mac had not been verified.", @"당시 파일은 클라우드에 보관되어 있었으며, 이 Mac에 저장되어 있는지는 확인되지 않았습니다."),
+            @"permission":Text(korean, @"Access was denied during this check. The recorded error does not identify which access control denied it.", @"당시 검사에서 접근 권한 오류가 발생했습니다. 기록된 오류만으로는 어떤 접근 설정이 영향을 주었는지 알 수 없습니다."),
+            @"authentication":Text(korean, @"An account authentication error prevented this operation at the time shown.", @"표시된 시각에 계정 인증 오류로 작업을 진행하지 못했습니다."),
+            @"cloud-refused":Text(korean, @"The cloud operation was not permitted at the time shown. This error alone does not establish whether a lock, permissions, or another restriction caused it.", @"당시 클라우드 작업이 허용되지 않았습니다. 이 오류만으로는 잠금, 권한 또는 다른 제한 중 무엇이 원인이었는지 알 수 없습니다."),
+            @"conflict":Text(korean, @"Another item already used the proposed name at this attempt, so the name change was deferred.", @"당시 정리 후 이름을 다른 항목이 사용하고 있어 이름 변경을 보류했습니다."),
+            @"readonly":Text(korean, @"The location was read-only at this attempt, so the change could not be made.", @"당시 위치가 읽기 전용이어서 변경하지 못했습니다."),
+            @"storage":Text(korean, @"The operation reported insufficient free disk space at the time shown.", @"당시 작업에서 디스크 여유 공간이 부족한 것으로 확인되었습니다."),
+            @"interrupted":Text(korean, @"This check was interrupted before it finished.", @"당시 검사를 마치기 전에 작업이 중단되었습니다."),
+            @"timeout":Text(korean, @"The operation did not respond in time during this check. The recorded error does not identify why.", @"당시 검사에서 응답 시간이 초과되었습니다. 기록된 오류만으로는 지연 원인을 알 수 없습니다."),
+            @"busy":Text(korean, @"The item was temporarily busy or unavailable for this operation at the time shown.", @"표시된 시각에 항목을 일시적으로 사용 중이거나 이 작업에 사용할 수 없었습니다."),
+            @"unavailable":Text(korean, @"The item or its location was unavailable at this check.", @"당시 검사에서 항목 또는 해당 위치를 사용할 수 없었습니다.")};
+        title = titles[category]; detail = details[category];
+        if (!title) {
+            BOOL missing = !reason.length && !error;
+            title = [kind isEqual:@"error"]
+                ? Text(korean, missing ? @"Check incomplete · cause not recorded" : @"Check could not be completed", missing ? @"검사 미완료 · 원인 기록 없음" : @"검사를 마치지 못했습니다")
+                : Text(korean, missing ? @"Check deferred · cause not recorded" : @"Check was deferred", missing ? @"확인 보류 · 원인 기록 없음" : @"확인을 보류했습니다");
+            detail = missing
+                ? Text(korean, @"The cause was not recorded for this older activity entry. Its current status cannot be inferred from this record.", @"이전 활동의 원인이 기록되지 않았습니다. 이 기록만으로 현재 상태를 알 수 없습니다.")
+                : Text(korean, @"The operation could not finish at the time shown. The recorded message does not establish a more specific cause.", @"표시된 시각에 작업을 마치지 못했습니다. 기록된 메시지만으로는 더 구체적인 원인을 알 수 없습니다.");
+            if (!missing) {
+                // Preserve useful raw context even when the separately saved
+                // errno is unknown. It must not override that typed evidence.
+                if (error) detail = [detail stringByAppendingFormat:Text(korean, @"\nRecorded errno: %@", @"\n기록된 오류 번호: %@"), error];
+                if (reason.length) {
+                    NSString *message = reason;
+                    if (message.length > 768) message = [[message substringToIndex:768] stringByAppendingString:@"…"];
+                    detail = [detail stringByAppendingFormat:Text(korean, @"\nRecorded message: %@", @"\n기록된 메시지: %@"), message];
+                }
+            }
+        }
+        NSNumber *occurrences = Count(event[@"occurrences"]);
+        NSNumber *first = ActivityTimestamp(event[@"first_at"]);
+        NSNumber *last = ActivityTimestamp(event[@"at"]);
+        if (occurrences.unsignedLongLongValue > 1 && ![category isEqual:@"cloud-only"]) {
+            detail = [detail stringByAppendingFormat:Text(korean, @"\nRecorded %@ times.", @"\n%@회 기록되었습니다."), Number(occurrences)];
+            if (first && last && first.doubleValue <= last.doubleValue)
+                detail = [detail stringByAppendingFormat:Text(korean, @" First recorded: %@.", @" 최초 기록: %@."), ActivityTime(first, korean)];
+        }
+    }
+    NSNumber *resolvedAt = ActivityTimestamp(event[@"resolved_at"]);
+    NSNumber *observedAt = ActivityTimestamp(event[@"at"]);
+    NSString *resolution = [event[@"resolution"] isKindOfClass:NSString.class] ? event[@"resolution"] : @"";
+    NSDictionary *outcomes = @{
+        @"checked":Text(korean, @"Checked successfully later", @"이후 검사 완료"),
+        @"renamed":Text(korean, @"Name changed later", @"이후 이름 변경 완료"),
+        @"restored":Text(korean, @"Original name restored later", @"이후 원래 이름으로 되돌림 완료"),
+        @"absent":Text(korean, @"Item was absent at a later check", @"이후 확인에서 항목 없음"),
+        @"no_longer_needed":Text(korean, @"Later check found no change needed", @"이후 확인에서 변경 불필요")};
+    BOOL resolved = historicalIssue && outcomes[resolution] && resolvedAt && (!observedAt || resolvedAt.doubleValue >= observedAt.doubleValue);
+    if (resolved) {
+        detail = [NSString stringWithFormat:Text(korean, @"Original observation: %@\n%@\n\n%@\nResolved at: %@", @"당시 기록: %@\n%@\n\n%@\n해결 시각: %@"), title, detail, outcomes[resolution], ActivityTime(resolvedAt, korean)];
+        title = outcomes[resolution];
+    }
+    return @{@"title":title, @"detail":detail, @"category":category, @"historicalIssue":@(historicalIssue), @"resolved":@(resolved),
+        @"resolvedAt":resolved ? resolvedAt : NSNull.null, @"path":path, @"pathActionAllowed":@(safePath)};
 }
 
 static NSArray *RetryIssues(id records, BOOL directory, BOOL korean) {
@@ -149,8 +319,9 @@ static NSArray *RetryIssues(id records, BOOL directory, BOOL korean) {
             }
         }
         NSString *operation = directory ? Text(korean, @"Folder check", @"폴더 확인") : Text(korean, @"Rename", @"이름 변경");
-        detail = [NSString stringWithFormat:@"%@\n%@%@ · %@", detail, operation,
-            attempts ? [NSString stringWithFormat:Text(korean, @" · %@ failed attempts", @" · 실패 %@회"), Number(attempts)] : @"", retryNote];
+        if (![advice[@"category"] isEqual:@"cloud-only"])
+            detail = [NSString stringWithFormat:@"%@\n%@%@ · %@", detail, operation,
+                attempts ? [NSString stringWithFormat:Text(korean, @" · %@ failed attempts", @" · 실패 %@회"), Number(attempts)] : @"", retryNote];
         [issues addObject:@{@"title":advice[@"title"], @"path":path, @"detail":detail, @"tone":required ? @"warning" : @"working",
             @"actionTitle":Text(korean, @"Show in Finder", @"Finder에서 확인"), @"action":@"reveal", @"requiresAction":@(required), @"category":advice[@"category"]}];
         if (issues.count == 8) break;
@@ -162,16 +333,29 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
     BOOL invalid = snapshot && !Dictionary(snapshot);
     BOOL failed = invalid || ([error isKindOfClass:NSString.class] && error.length);
     NSDictionary *status = failed ? nil : Dictionary(snapshot);
+    NSDictionary *current = Dictionary(status[@"current"]);
+    if (current) {
+        // The worker projects active work separately from retained drive history.
+        // Keep process, coverage, recovery and saved-index totals authoritative.
+        NSMutableDictionary *display = [status mutableCopy];
+        for (NSString *key in @[@"pending_jobs", @"deferred_jobs", @"deferred_renames", @"next_retry",
+            @"directory_retry_count", @"directory_retry_items", @"rename_retry_items", @"pending_baseline_roots",
+            @"baseline_complete", @"needs_revalidation"])
+            if (current[key]) display[key] = current[key];
+        status = display;
+    }
     NSNumber *running = Flag(status[@"running"]), *paused = Flag(status[@"paused"]), *apply = Flag(status[@"apply"]);
     NSNumber *baseline = Flag(status[@"baseline_complete"]), *recovery = Flag(status[@"pending_recovery"]);
     NSNumber *revalidation = Flag(status[@"needs_revalidation"]);
     NSNumber *indexed = Count(status[@"indexed_entries"]), *queued = Count(status[@"pending_jobs"]);
     NSNumber *renames = Count(status[@"deferred_renames"]), *deferred = Count(status[@"deferred_jobs"]);
+    NSNumber *directoryRetries = Count(status[@"directory_retry_count"]);
     NSNumber *errors = Count(status[@"errors"]);
     NSArray *roots = Paths(status[@"roots"]), *active = Paths(status[@"active_roots"]);
     NSArray *unavailable = FailurePaths(status[@"unavailable_roots"]);
     NSArray *catalogs = FailurePaths(status[@"catalog_unavailable"]);
     NSArray *pendingRoots = Paths(status[@"pending_baseline_roots"]);
+    NSArray *disconnected = Paths(status[@"disconnected_roots"]);
     BOOL isRunning = running.boolValue, isPaused = isRunning && paused.boolValue;
     NSNumber *indexedFlag = Flag(status[@"indexed"]);
     BOOL preparing = isRunning && indexedFlag && !indexedFlag.boolValue;
@@ -194,7 +378,7 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
         if (!actionCategory) actionCategory = issue[@"category"];
         else if (![actionCategory isEqual:issue[@"category"]]) actionCategory = @"mixed";
     }
-    BOOL hasRetries = renames.unsignedLongLongValue || retryScheduled || issues.count;
+    BOOL hasRetries = renames.unsignedLongLongValue || directoryRetries.unsignedLongLongValue || retryScheduled || issues.count;
     BOOL currentProblems = unavailable.count || catalogs.count || intervention;
     NSString *issueSummary = @"";
     if (hasRetries) {
@@ -211,6 +395,35 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
                 : [NSString stringWithFormat:@" Showing %lu of %@ queued retry items (up to eight of each type).", (unsigned long)issues.count, Number(@(total))]];
         }
     }
+
+    // Retry work is contextual information, separate from overall worker activity.
+    // The saved detail lists are bounded; their unseen rows may need intervention.
+    NSUInteger automaticIssues = issues.count - intervention;
+    double totalRetries = renames.doubleValue + directoryRetries.doubleValue;
+    BOOL completeDetails = renames && directoryRetries && totalRetries == issues.count;
+    BOOL onlyCloudWaiting = completeDetails && issues.count > 0;
+    for (NSDictionary *issue in issues) if (![issue[@"category"] isEqual:@"cloud-only"]) onlyCloudWaiting = NO;
+    BOOL hasAutomaticDetails = automaticIssues || (hasRetries && !intervention) || totalRetries > issues.count;
+    NSString *actionIssueSummary = intervention
+        ? Text(korean, @"Follow each item's steps to check its account, connection, access, or name.", @"항목별 안내에 따라 계정, 연결, 접근 상태 또는 이름을 확인하세요.") : @"";
+    NSString *automaticRetrySummary = @"", *automaticRetryDetail = @"";
+    if (hasAutomaticDetails) {
+        automaticRetrySummary = completeDetails
+            ? [NSString stringWithFormat:Text(korean, @"Automatic retries · %@", @"자동 재시도 · %@개"), Number(@(automaticIssues))]
+            : Text(korean, @"Retry details", @"재시도 내역");
+        automaticRetryDetail = Text(korean, @"Cleanup retries these items automatically. The list below shows each item’s location, cause, and retry time.", @"이 항목은 자동으로 다시 처리합니다. 아래에서 위치, 원인과 재시도 시각을 확인할 수 있습니다.");
+        if (onlyCloudWaiting) {
+            automaticRetrySummary = [NSString stringWithFormat:Text(korean, @"Stored in the cloud · %@", @"클라우드에 보관 중 · %@개"), Number(@(automaticIssues))];
+            automaticRetryDetail = Text(korean, @"Filename cleanup resumes when these files are available on this Mac.", @"이 Mac에 파일이 저장되면 이름을 정리합니다.");
+            issueSummary = automaticRetryDetail;
+        }
+        if (!isRunning || isPaused) automaticRetryDetail = [Text(korean, @"Start or resume cleanup to allow retries. ", @"재시도하려면 ‘작업 시작’ 또는 ‘계속 진행’을 선택하세요. ") stringByAppendingString:automaticRetryDetail];
+        if (!completeDetails) automaticRetryDetail = [automaticRetryDetail stringByAppendingString:
+            Text(korean, @" Some retry details may be unavailable. Refresh to load the latest entries.", @" 일부 재시도 내역만 표시될 수 있습니다. 최신 항목을 불러오려면 새로고침하세요.")];
+    }
+    unsigned long long ordinaryQueued = queued.unsignedLongLongValue;
+    if (directoryRetries) ordinaryQueued = ordinaryQueued > directoryRetries.unsignedLongLongValue
+        ? ordinaryQueued - directoryRetries.unsignedLongLongValue : 0;
 
     NSString *title = Text(korean, @"Status incomplete", @"상태 정보 확인 중");
     NSString *subtitle = Text(korean, @"Refresh to load the remaining status information.", @"나머지 상태 정보를 불러오려면 새로고침하세요.");
@@ -267,10 +480,10 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
             else title = Text(korean, @"Some items need a manual check", @"직접 확인할 항목 있음");
             subtitle = Text(korean, @"Follow the steps for each affected item below. Other work can continue while you check.", @"아래 항목별 안내에 따라 문제를 확인하세요. 확인하는 동안 다른 항목은 계속 처리할 수 있습니다.");
             tone = @"warning"; symbol = @"exclamationmark.triangle";
-        } else if (hasRetries && !initial && !revalidation.boolValue) {
-            title = Text(korean, @"Waiting to retry some items", @"일부 항목 재시도 대기");
-            subtitle = Text(korean, @"Jaso NFC keeps watching for changes. Check the retry list below for the next attempt and any steps you can take.", @"새 변경 사항을 계속 살펴보고 있습니다. 아래 재시도 목록에서 다음 시도 시각과 확인할 사항을 살펴보세요.");
-            tone = @"working"; symbol = @"clock.arrow.circlepath";
+        } else if (isRunning && coverageKnown && active.count == 0 && disconnected.count) {
+            title = Text(korean, @"No drives connected", @"연결된 드라이브 없음");
+            subtitle = Text(korean, @"Choose the drives to include in Settings → Manage folders….", @"설정 → 정리할 폴더…에서 관리할 드라이브를 선택하세요.");
+            tone = @"neutral"; symbol = @"externaldrive";
         } else if (revalidation.boolValue) {
             title = Text(korean, @"Rechecking locations", @"위치 다시 확인 중");
             subtitle = Text(korean, @"Rechecking saved file information before continuing cleanup.", @"정리를 이어가기 전에 저장된 파일 정보를 다시 확인하고 있습니다.");
@@ -279,7 +492,7 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
             title = Text(korean, @"Initial indexing", @"최초 인덱싱 중");
             subtitle = Text(korean, @"Building the first list of files and folders in your selected locations.", @"선택한 위치의 파일과 폴더를 확인해 첫 목록을 만들고 있습니다.");
             tone = @"working"; symbol = @"tray.and.arrow.down";
-        } else if (isRunning && paused && queued.unsignedLongLongValue > 0) {
+        } else if (isRunning && paused && ordinaryQueued > 0) {
             title = Text(korean, @"Processing changes", @"변경 사항 처리 중");
             subtitle = Text(korean, @"Checking waiting folders and updating the file list.", @"대기 중인 폴더를 확인하고 파일 목록을 갱신하고 있습니다.");
             tone = @"working"; symbol = @"arrow.triangle.2.circlepath";
@@ -325,11 +538,6 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
         Text(korean, @"Use Manage folders… to preview current and proposed names and start automatic cleanup.", @"‘정리할 폴더…’에서 현재 이름과 정리 후 이름을 확인하고 자동 정리를 시작하세요."), @"neutral")];
     if (revalidation.boolValue) [notices addObject:Notice(Text(korean, @"Location recheck required", @"위치 재확인 필요"),
         Text(korean, @"Rechecking saved drive information. The file list may update afterward.", @"저장된 드라이브 정보를 다시 확인하고 있습니다. 확인 후 파일 목록이 갱신될 수 있습니다."), @"working")];
-    if (renames.unsignedLongLongValue) [notices addObject:Notice(Text(korean, @"Rename retries pending", @"이름 변경 재시도 대기"),
-        [NSString stringWithFormat:Text(korean, @"%@ items are waiting for another attempt. See the retry list above for their causes and next steps.", @"%@개 항목이 다음 시도를 기다리고 있습니다. 위 재시도 목록에서 원인과 다음 조치를 확인하세요."), Number(renames)], @"neutral")];
-    if (retryScheduled)
-        [notices addObject:Notice(Text(korean, @"Directory retry scheduled", @"폴더 재시도 예정"),
-            Text(korean, @"A folder check will retry automatically while cleanup is running. Resume first if paused. This work is included in Queued folders.", @"정리가 실행 중이면 폴더 확인을 자동으로 재시도합니다. 일시정지한 경우 먼저 ‘계속 진행’을 선택하세요. 이 작업은 대기 폴더 수에 포함됩니다."), @"neutral")];
     if (deferred.unsignedLongLongValue) [notices addObject:Notice(Text(korean, @"Deferred directory work", @"처리를 미룬 폴더 작업"),
         [NSString stringWithFormat:Text(korean, @"%@ folder jobs are waiting for queue capacity. They are included in Queued folders.", @"%@개 폴더 작업이 처리 순서에 들어갈 여유를 기다리고 있습니다. 이 작업은 대기 폴더 수에 포함됩니다."), Number(deferred)], @"neutral")];
     if (errors.unsignedLongLongValue) [notices addObject:Notice(Text(korean, @"Historical scan errors", @"과거 폴더 확인 오류"),
@@ -342,9 +550,11 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
     NSMutableArray *locations = [NSMutableArray array];
     for (NSString *path in [allPaths.array sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
         BOOL unavailableRoot = [unavailable containsObject:path], catalog = [catalogs containsObject:path];
+        if ([disconnected containsObject:path] && ![active containsObject:path] && !unavailableRoot && !catalog) continue;
         NSString *state = Text(korean, @"Status unavailable", @"상태 확인 불가");
         NSString *detail = Text(korean, @"This is a saved location. Refresh to check whether it is being watched.", @"설정에 저장된 위치입니다. 현재 감시 상태를 확인하려면 새로고침하세요.");
         NSString *locationTone = @"neutral";
+        BOOL requiresAction = NO;
         if (running && !isRunning) {
             state = Text(korean, @"Saved location", @"저장된 위치");
             detail = Text(korean, @"This location was saved before cleanup stopped. Start cleanup to watch it again.", @"정리 중지 전에 저장된 위치입니다. 작업을 시작하면 다시 감시합니다.");
@@ -362,6 +572,7 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
             NSDictionary *rootAdvice = unavailableRoot ? FailureAdvice(path, Dictionary(status[@"unavailable_roots"])[path], NO, NO, korean) : nil;
             NSDictionary *catalogAdvice = catalog ? FailureAdvice(path, Dictionary(status[@"catalog_unavailable"])[path], NO, NO, korean) : nil;
             state = (rootAdvice ?: catalogAdvice)[@"title"];
+            requiresAction = [rootAdvice[@"requiresAction"] boolValue] || [catalogAdvice[@"requiresAction"] boolValue];
             NSMutableArray *details = [NSMutableArray array];
             if (rootAdvice) [details addObject:[NSString stringWithFormat:@"%@ %@",
                 Text(korean, @"Could not start watching this location.", @"이 위치의 감시를 시작하지 못했습니다."), rootAdvice[@"detail"]]];
@@ -377,9 +588,10 @@ NSDictionary *JasoStatusPresentation(NSDictionary *snapshot, NSString *error, BO
         if (catalog && ([path isEqual:@"/Users"] || [path isEqual:@"users"])) locationTitle = Text(korean, @"User folders", @"사용자 폴더");
         if (catalog && ([path isEqual:@"/Volumes"] || [path isEqual:@"volumes"])) locationTitle = Text(korean, @"Mounted volumes", @"마운트된 볼륨");
         [locations addObject:@{@"title":locationTitle,
-            @"path":path, @"state":state, @"detail":detail, @"tone":locationTone}];
+            @"path":path, @"state":state, @"detail":detail, @"tone":locationTone, @"requiresAction":@(requiresAction)}];
     }
     return @{@"title":title, @"subtitle":subtitle, @"tone":tone, @"symbol":symbol,
         @"metrics":metrics, @"locations":locations, @"notices":notices, @"issues":issues, @"issueSummary":issueSummary,
+        @"actionIssueSummary":actionIssueSummary, @"automaticRetrySummary":automaticRetrySummary, @"automaticRetryDetail":automaticRetryDetail,
         @"primaryTitle":primaryTitle, @"primaryAction":primaryAction, @"progressNote":progress};
 }

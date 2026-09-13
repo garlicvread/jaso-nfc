@@ -1,6 +1,538 @@
 use super::*;
 use serde_json::json;
 
+fn saved_rows(db: &Connection, table: &str) -> Result<Vec<Vec<SqlValue>>> {
+    let mut statement = db.prepare(&format!("SELECT * FROM {table} ORDER BY 1"))?;
+    let columns = statement.column_count();
+    Ok(statement
+        .query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn legacy_storage_fixture(path: &Path) -> Result<()> {
+    let db = Connection::open(path)?;
+    db.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('filename_policy_revision','1'),('baseline_complete','true'),('identity','[\"saved\"]');
+         CREATE TABLE entries (path TEXT PRIMARY KEY, parent TEXT NOT NULL, kind TEXT NOT NULL,
+            dev INTEGER, ino INTEGER, mtime_ns INTEGER, ctime_ns INTEGER, size INTEGER, mode INTEGER);
+         CREATE INDEX entries_parent ON entries(parent);
+         CREATE TABLE directories (path TEXT PRIMARY KEY);
+         CREATE TABLE volumes (key TEXT PRIMARY KEY, uuid TEXT NOT NULL, device INTEGER NOT NULL,
+            mount TEXT NOT NULL, roots TEXT NOT NULL, cursor TEXT);
+         INSERT INTO volumes VALUES ('disk','uuid',1,'/','[\"/saved\"]','18446744073709551615');
+         CREATE TABLE jobs (path TEXT PRIMARY KEY, volume_key TEXT NOT NULL, recursive INTEGER NOT NULL,
+            baseline INTEGER NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 1,
+            attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0, error TEXT);
+         INSERT INTO jobs(rowid,path,volume_key,recursive,baseline,generation,attempts,next_attempt,error)
+            VALUES (410,'/saved','disk',1,1,7,4,123456789,'Permission denied');
+         CREATE TABLE scan_runs (path TEXT PRIMARY KEY, scan_id TEXT NOT NULL, job TEXT NOT NULL);
+         INSERT INTO scan_runs VALUES ('/saved','in-progress','saved job');
+         CREATE TABLE scan_seen (scope TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(scope,path));
+         INSERT INTO scan_seen VALUES ('/saved','/saved/café');
+         CREATE TABLE inactive_volumes (key TEXT PRIMARY KEY);
+         INSERT INTO inactive_volumes VALUES ('disk');
+         CREATE TABLE deferred_jobs (path TEXT PRIMARY KEY, volume_key TEXT NOT NULL,
+            recursive INTEGER NOT NULL, baseline INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE metrics (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+         INSERT INTO metrics VALUES ('errors',42);",
+    )?;
+    let prefix = format!("/saved/{}", "long-directory-prefix-".repeat(8));
+    db.execute(
+        "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<4000)
+         INSERT INTO entries SELECT ?1||'/'||printf('file-%04d',i),?1,'file',1,i,17,23,31,33188 FROM n",
+        [&prefix],
+    )?;
+    for path in [
+        "/root-file",
+        "/saved/café",
+        "/saved/cafe\u{301}",
+        "/saved/100%_done",
+    ] {
+        db.execute(
+            "INSERT INTO entries VALUES (?,?,'file',NULL,'u:18446744073709551615',-1,NULL,0,NULL)",
+            params![path, parent(path)],
+        )?;
+    }
+    db.execute("INSERT INTO directories VALUES (?)", [&prefix])?;
+    db.execute_batch("CREATE TABLE discarded (value BLOB); INSERT INTO discarded VALUES (zeroblob(2000000)); DROP TABLE discarded;")?;
+    Ok(())
+}
+
+#[test]
+fn legacy_index_compacts_losslessly_without_rebuilding_or_resetting_work() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index.sqlite3");
+    legacy_storage_fixture(&path)?;
+    let before = Connection::open(&path)?;
+    let observations = saved_rows(&before, "entries")?;
+    let tables = [
+        "directories",
+        "volumes",
+        "scan_runs",
+        "scan_seen",
+        "inactive_volumes",
+        "metrics",
+    ];
+    let saved: Vec<_> = tables
+        .iter()
+        .map(|table| saved_rows(&before, table))
+        .collect::<Result<_>>()?;
+    let before_size = std::fs::metadata(&path)?.len();
+    drop(before);
+    let index = Index::new(&path, false)?;
+    let state = index.lock()?;
+    assert_eq!(saved_rows(&state.db, "entries")?, observations);
+    for (table, expected) in tables.iter().zip(saved) {
+        assert_eq!(saved_rows(&state.db, table)?, expected, "{table}");
+    }
+    let retry: (i64, i64, f64, String) = state.db.query_row(
+        "SELECT generation,attempts,next_attempt,error FROM jobs",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(retry, (7, 4, 123456789.0, "Permission denied".into()));
+    assert_eq!(
+        state
+            .db
+            .query_row("SELECT rowid FROM jobs", [], |row| row.get::<_, i64>(0))?,
+        410
+    );
+    assert_eq!(state.get::<u32>("filename_policy_revision", 0)?, 1);
+    assert_eq!(
+        state.get::<Value>("identity", Value::Null)?,
+        json!(["saved"])
+    );
+    state.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let after_size = std::fs::metadata(&path)?.len();
+    eprintln!("legacy storage={before_size} bytes; compact storage={after_size} bytes");
+    assert!(
+        after_size < before_size / 2,
+        "legacy={before_size}, compact={after_size}"
+    );
+    assert_eq!(
+        state
+            .db
+            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?,
+        0
+    );
+    assert_eq!(
+        state
+            .db
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?,
+        "ok"
+    );
+    let schema_version: i64 = state
+        .db
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+    drop(state);
+    drop(index);
+    let reopened = Index::new(&path, false)?;
+    assert_eq!(
+        reopened
+            .lock()?
+            .db
+            .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?,
+        schema_version,
+        "reopening must not vacuum again"
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_worker_can_reopen_and_mutate_a_compacted_index() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index.sqlite3");
+    legacy_storage_fixture(&path)?;
+    drop(Index::new(&path, false)?);
+    assert!(restore_legacy_storage(&path)?);
+    let legacy = Connection::open(&path)?;
+    // These statements are the writable-open and observation interface in
+    // 402d061, which an installer rollback must still be able to execute.
+    legacy.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entries (
+            path TEXT PRIMARY KEY, parent TEXT NOT NULL, kind TEXT NOT NULL,
+            dev INTEGER, ino INTEGER, mtime_ns INTEGER, ctime_ns INTEGER,
+            size INTEGER, mode INTEGER);
+         CREATE INDEX IF NOT EXISTS entries_parent ON entries(parent);",
+    )?;
+    let insert = "INSERT OR REPLACE INTO entries(path,parent,kind,dev,ino,mtime_ns,ctime_ns,size,mode) VALUES(?,?,'file',1,'u:18446744073709551615',7,11,?,33188)";
+    legacy.execute(insert, params!["/rollback/cafe\u{301}", "/rollback", 13])?;
+    legacy.execute(insert, params!["/rollback/sibling", "/rollback", 17])?;
+    legacy.execute(insert, params!["/rollback/cafe\u{301}", "/rollback", 19])?;
+    assert_eq!(
+        legacy.query_row(
+            "SELECT count(*) FROM entries WHERE parent='/rollback'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        2
+    );
+    assert_eq!(
+        legacy.query_row(
+            "SELECT size FROM entries WHERE path='/rollback/café'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        19
+    );
+    legacy.execute(insert, params!["/rollback/cafe\u{301}", "/rollback", 19])?;
+    assert_eq!(
+        legacy.query_row(
+            "SELECT count(*) FROM entries WHERE parent='/rollback'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        2
+    );
+    legacy.execute(
+        "DELETE FROM entries WHERE path>=? AND path<?",
+        params!["/rollback/", "/rollback/\u{10ffff}"],
+    )?;
+    assert_eq!(
+        legacy.query_row(
+            "SELECT count(*) FROM entries WHERE parent='/rollback'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0
+    );
+    assert_eq!(
+        legacy.query_row("SELECT count(*) FROM entries", [], |row| row
+            .get::<_, i64>(0))?,
+        4004
+    );
+    legacy.execute("DELETE FROM entries", [])?;
+    assert_eq!(
+        legacy.query_row("SELECT count(*) FROM entries", [], |row| row
+            .get::<_, i64>(0))?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_entry_updates_preserve_identity_and_transaction_rollback() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index.sqlite3");
+    let index = Index::new(&path, false)?;
+    index
+        .lock()?
+        .observe_entry(&entry("/before/original", "file", u64::MAX))?;
+    drop(index);
+    assert!(restore_legacy_storage(&path)?);
+    let db = Connection::open(&path)?;
+    let before = saved_rows(&db, "entries")?;
+    let transaction = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
+    transaction.execute("UPDATE entries SET path='/after/renamed',parent='/after',size=37 WHERE path='/before/original'", [])?;
+    assert_eq!(
+        transaction.query_row(
+            "SELECT size FROM entries WHERE path='/after/renamed'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        37
+    );
+    transaction.rollback()?;
+    assert_eq!(saved_rows(&db, "entries")?, before);
+    Ok(())
+}
+
+#[test]
+fn legacy_recovery_preserves_frontier_cursors_and_is_idempotent() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index.sqlite3");
+    legacy_storage_fixture(&path)?;
+    drop(Index::new(&path, false)?);
+    let before = Connection::open(&path)?;
+    let tables = [
+        "entries",
+        "directories",
+        "jobs",
+        "volumes",
+        "scan_runs",
+        "scan_seen",
+        "inactive_volumes",
+        "deferred_jobs",
+        "metrics",
+    ];
+    let saved: Vec<_> = tables
+        .iter()
+        .map(|table| saved_rows(&before, table))
+        .collect::<Result<_>>()?;
+    let queue_rowid: i64 = before.query_row("SELECT rowid FROM jobs", [], |row| row.get(0))?;
+    let meta: Vec<_> = saved_rows(&before, "meta")?
+        .into_iter()
+        .filter(|row| !matches!(&row[0], SqlValue::Text(key) if key.starts_with("entry_storage_")))
+        .collect();
+    drop(before);
+    assert!(restore_legacy_storage(&path)?);
+    let restored = Connection::open(&path)?;
+    for (table, expected) in tables.iter().zip(saved) {
+        assert_eq!(saved_rows(&restored, table)?, expected, "{table}");
+    }
+    assert_eq!(
+        restored.query_row("SELECT rowid FROM jobs", [], |row| row.get::<_, i64>(0))?,
+        queue_rowid
+    );
+    assert_eq!(saved_rows(&restored, "meta")?, meta);
+    assert_eq!(
+        restored.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?,
+        "ok"
+    );
+    let schema = saved_rows(&restored, "sqlite_master")?;
+    assert!(!restore_legacy_storage(&path)?);
+    assert_eq!(saved_rows(&restored, "sqlite_master")?, schema);
+    drop(restored);
+    drop(Index::new(&path, false)?);
+    assert!(
+        restore_legacy_storage(&path)?,
+        "a later upgrade can compact the recovered legacy format again"
+    );
+    assert!(!restore_legacy_storage(
+        temp.path().join("missing.sqlite3")
+    )?);
+    Ok(())
+}
+
+#[test]
+fn failed_legacy_recovery_restores_compact_schema_and_observations() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index.sqlite3");
+    legacy_storage_fixture(&path)?;
+    drop(Index::new(&path, false)?);
+    let db = Connection::open(&path)?;
+    // Force a late failure after the view has been dropped and the replacement
+    // table renamed. SQLite must roll back the whole conversion, not just rows.
+    db.execute("CREATE INDEX entries_parent ON jobs(path)", [])?;
+    let schema = saved_rows(&db, "sqlite_master")?;
+    let entries = saved_rows(&db, "entries")?;
+    let jobs = saved_rows(&db, "jobs")?;
+    let meta = saved_rows(&db, "meta")?;
+    assert!(restore_legacy_storage(&path).is_err());
+    assert_eq!(saved_rows(&db, "sqlite_master")?, schema);
+    assert_eq!(saved_rows(&db, "entries")?, entries);
+    assert_eq!(saved_rows(&db, "jobs")?, jobs);
+    assert_eq!(saved_rows(&db, "meta")?, meta);
+    db.execute("DROP INDEX entries_parent", [])?;
+    assert!(restore_legacy_storage(&path)?);
+    Ok(())
+}
+
+#[test]
+fn repeated_unchanged_observation_does_not_rewrite_entry_storage() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let item = entry(&format!("{}/saved", f.root), "file", u64::MAX);
+    f.baseline(vec![item.clone()])?;
+    let state = f.index.lock()?;
+    let job = Job {
+        path: f.root.clone(),
+        volume_key: "disk".into(),
+        recursive: false,
+        baseline: false,
+        generation: 1,
+        attempts: 0,
+        ready_class: 0,
+        ordinary_scope: 0,
+    };
+    let result = ScanResult {
+        scope: f.root.clone(),
+        entries: vec![item.clone()],
+        directories: vec![f.root.clone()],
+        ..Default::default()
+    };
+    let before = state.db.total_changes();
+    state.replace(&job, &result, &BTreeSet::new())?;
+    assert_eq!(
+        state.db.total_changes(),
+        before,
+        "identical metadata must be a storage no-op"
+    );
+    let mut changed = result;
+    changed.entries[0].size += 1;
+    state.replace(&job, &changed, &BTreeSet::new())?;
+    assert_eq!(
+        state.db.total_changes(),
+        before + 1,
+        "a changed entry must still be persisted"
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_legacy_entry_rolls_back_migration_and_all_schema_changes() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index.sqlite3");
+    legacy_storage_fixture(&path)?;
+    let db = Connection::open(&path)?;
+    db.execute(
+        "UPDATE entries SET parent='/wrong-parent' WHERE path='/root-file'",
+        [],
+    )?;
+    let schema = saved_rows(&db, "sqlite_master")?;
+    let entries = saved_rows(&db, "entries")?;
+    let jobs = saved_rows(&db, "jobs")?;
+    assert!(Index::new(&path, false).is_err());
+    assert_eq!(saved_rows(&db, "sqlite_master")?, schema);
+    assert_eq!(saved_rows(&db, "entries")?, entries);
+    assert_eq!(saved_rows(&db, "jobs")?, jobs);
+    Ok(())
+}
+
+#[test]
+fn readonly_legacy_index_does_not_migrate_or_reclaim_pages() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index.sqlite3");
+    legacy_storage_fixture(&path)?;
+    let before = std::fs::read(&path)?;
+    let reader = Index::new(&path, true)?;
+    assert_eq!(reader.status()?["indexed_entries"], 4004);
+    assert_eq!(std::fs::read(&path)?, before);
+    Ok(())
+}
+
+#[test]
+fn migration_reclamation_resumes_after_interruption_without_copying_again() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index.sqlite3");
+    legacy_storage_fixture(&path)?;
+    let db = Connection::open(&path)?;
+    // Simulate termination after the schema transaction committed but before
+    // the separate VACUUM. Reopening must consume its durable recovery marker.
+    let transaction = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
+    initialize_entry_storage(&transaction)?;
+    transaction.commit()?;
+    assert!(db.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))? > 0);
+    let rows = saved_rows(&db, "entries")?;
+    drop(db);
+    let index = Index::new(&path, false)?;
+    let state = index.lock()?;
+    assert_eq!(saved_rows(&state.db, "entries")?, rows);
+    assert_eq!(
+        state
+            .db
+            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?,
+        0
+    );
+    assert!(!state.get("entry_storage_compaction_pending", false)?);
+    Ok(())
+}
+
+#[test]
+fn compact_pruning_preserves_nested_roots_and_collects_unused_parents() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let index = Index::new(temp.path().join("index.sqlite3"), false)?;
+    let state = index.lock()?;
+    let paths = [
+        "/keep",
+        "/keep/child",
+        "/keep2/child",
+        "/a/keep",
+        "/a/keep/child",
+        "/a/keep-sibling",
+        "/a/child",
+        "/cafe\u{301}/child",
+        "/café/child",
+    ];
+    for (n, path) in paths.iter().enumerate() {
+        state.observe_entry(&entry(path, "file", n as u64))?;
+    }
+    state.prune("/a", false, &["/a/keep".into()])?;
+    let saved: BTreeSet<String> = state
+        .db
+        .prepare("SELECT path FROM entries")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(
+        saved,
+        paths
+            .into_iter()
+            .filter(|path| !["/a/keep-sibling", "/a/child"].contains(path))
+            .map(String::from)
+            .collect()
+    );
+    state.prune("/café", true, &[])?;
+    assert!(state.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entries WHERE path='/café/child')",
+        [],
+        |row| row.get::<_, bool>(0)
+    )?);
+    state.prune("/", false, &["/keep".into()])?;
+    let saved: BTreeSet<String> = state
+        .db
+        .prepare("SELECT path FROM entries")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(
+        saved,
+        BTreeSet::from(["/keep".into(), "/keep/child".into()])
+    );
+    assert_eq!(state.db.query_row("SELECT count(*) FROM entry_parents WHERE NOT EXISTS(SELECT 1 FROM entry_data WHERE parent_id=entry_parents.id)", [], |row| row.get::<_,i64>(0))?, 0);
+    state.prune("/keep", true, &[])?;
+    assert_eq!(
+        state
+            .db
+            .query_row("SELECT count(*) FROM entry_parents", [], |row| row
+                .get::<_, i64>(0))?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn encoding_repair_upgrade_preserves_an_existing_failed_root_deadline() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.baseline(vec![])?;
+    let deadline = now() + 86_400.0;
+    {
+        let state = f.index.lock()?;
+        state
+            .db
+            .execute("DELETE FROM meta WHERE key='filename_policy_revision'", [])?;
+        state.db.execute("INSERT INTO jobs(path,volume_key,recursive,attempts,next_attempt,error) VALUES (?,?,1,4,?,'fixture unavailable')", params![f.root, f.volume.key, deadline])?;
+    }
+    f.reopen()?;
+    // The upgrade was staged durably, but the worker can restart before queueing.
+    f.reopen()?;
+    f.index.bootstrap_jobs()?;
+    let saved: (i64, f64, String) = f.index.lock()?.db.query_row(
+        "SELECT attempts,next_attempt,error FROM jobs WHERE path=?",
+        [&f.root],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(saved, (4, deadline, "fixture unavailable".into()));
+    assert!(!f.index.work(&mut f.scan)?);
+    Ok(())
+}
+
+#[test]
+fn encoding_repair_policy_upgrade_stages_roots_once_and_preserves_cursor() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let source = format!("{}/µµÀüÀÇ IRÆ÷½ºÅÍ-ÃÖÁ¾º».pdf", f.root);
+    f.baseline(vec![entry(&source, "file", 1)])?;
+    f.index.seed_cursor(&f.volume.key, 4242)?;
+    f.index
+        .lock()?
+        .db
+        .execute("DELETE FROM meta WHERE key='filename_policy_revision'", [])?;
+    f.reopen()?;
+    assert_eq!(f.index.cursor(&f.volume.key)?, Some(4242));
+    assert!(f.paths()?.contains(&source));
+    assert_eq!(f.index.status()?["pending_baseline_roots"], json!([f.root]));
+    f.index.bootstrap_jobs()?;
+    f.drain()?;
+    assert_eq!(f.scan.calls.len(), 1);
+    f.scan.calls.clear();
+    f.reopen()?;
+    f.index.bootstrap_jobs()?;
+    f.drain()?;
+    assert!(f.scan.calls.is_empty());
+    assert_eq!(f.index.cursor(&f.volume.key)?, Some(4242));
+    Ok(())
+}
+
 #[test]
 fn configured_baseline_is_staged_and_cursor_survives_device_renumbering() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -500,7 +1032,7 @@ fn strict_metadata_fast_path_only_skips_known_regular_nfc_files() -> Result<()> 
         entry(&unknown_mode, "file", 5),
     ])?;
     Connection::open(&f.path)?
-        .execute("UPDATE entries SET mode=NULL WHERE path=?", [&unknown_mode])?;
+        .execute("UPDATE entry_data SET mode=NULL WHERE parent_id=(SELECT id FROM entry_parents WHERE path=?) AND name=?", params![parent(&unknown_mode),basename(&unknown_mode)])?;
     let flags = [0x11000, 0x10400, 0x12000, 0x14000, 0x18000, 0x15400];
     for (i, flags) in flags.into_iter().enumerate() {
         f.index
@@ -511,7 +1043,7 @@ fn strict_metadata_fast_path_only_skips_known_regular_nfc_files() -> Result<()> 
     for path in [nfd, link, fifo, unknown_mode, format!("{}/new", f.root)] {
         if path.ends_with("/unknown_mode") {
             Connection::open(&f.path)?
-                .execute("UPDATE entries SET mode=NULL WHERE path=?", [&path])?;
+                .execute("UPDATE entry_data SET mode=NULL WHERE parent_id=(SELECT id FROM entry_parents WHERE path=?) AND name=?", params![parent(&path),basename(&path)])?;
         }
         f.index.enqueue("disk", &[event(&path, 9, 0x11000)])?;
         assert!(f.index.work(&mut f.scan)?, "metadata must scan {path}");
@@ -523,6 +1055,19 @@ fn strict_metadata_fast_path_only_skips_known_regular_nfc_files() -> Result<()> 
         assert!(f.index.work(&mut f.scan)?);
         f.drain()?;
     }
+    Ok(())
+}
+
+#[test]
+fn encoding_repair_candidate_content_event_is_not_ignored_as_nfc() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let source = format!("{}/µµÀüÀÇ IRÆ÷½ºÅÍ-ÃÖÁ¾º».pdf", f.root);
+    f.baseline(vec![entry(&source, "file", 1)])?;
+    f.index.enqueue("disk", &[event(&source, 1, 0x11000)])?;
+    assert!(
+        f.index.work(&mut f.scan)?,
+        "a repairable name must receive a scan even when already NFC"
+    );
     Ok(())
 }
 
@@ -1381,7 +1926,7 @@ fn due_event_and_baseline_work_both_receive_finite_service() -> Result<()> {
     let ordinary = format!("{}/ordinary", f.root);
     {
         let state = f.index.lock()?;
-        for n in 0..16 {
+        for n in 0..ORDINARY_BURST_LIMIT * 3 {
             state.queue(
                 &format!("{}/baseline-{n:02}", f.root),
                 "disk",
@@ -1392,7 +1937,7 @@ fn due_event_and_baseline_work_both_receive_finite_service() -> Result<()> {
             )?;
         }
     }
-    for _ in 0..ORDINARY_BURST_LIMIT * 2 + 8 {
+    for _ in 0..ORDINARY_BURST_LIMIT * 4 + 8 {
         f.index.enqueue(
             "disk",
             &[event(&format!("{ordinary}/changed"), 1, CREATED | IS_FILE)],
@@ -1410,7 +1955,7 @@ fn due_event_and_baseline_work_both_receive_finite_service() -> Result<()> {
     assert!(
         f.scan
             .calls
-            .windows(ORDINARY_BURST_LIMIT as usize + 1)
+            .windows(ORDINARY_BURST_LIMIT as usize * 2 + 1)
             .all(|window| window.iter().any(|path| path != &ordinary))
     );
     assert_eq!(f.index.status()?["baseline_complete"], false);
@@ -1446,7 +1991,7 @@ fn due_failed_work_receives_service_amid_continuous_fresh_jobs() -> Result<()> {
             ..Default::default()
         },
     );
-    for n in 0..ORDINARY_BURST_LIMIT * 2 + 8 {
+    for n in 0..ORDINARY_BURST_LIMIT * 4 + 10 {
         {
             let state = f.index.lock()?;
             state.queue(
@@ -1481,7 +2026,7 @@ fn due_failed_work_receives_service_amid_continuous_fresh_jobs() -> Result<()> {
             .count()
             >= ORDINARY_BURST_LIMIT as usize * 2
     );
-    for group in f.scan.calls.windows(ORDINARY_BURST_LIMIT as usize + 2) {
+    for group in f.scan.calls.windows(ORDINARY_BURST_LIMIT as usize * 2 + 1) {
         assert!(group.contains(&failed), "failed work starved: {group:?}");
         assert!(
             group.iter().any(|path| path.contains("/fresh-")),
@@ -1593,6 +2138,208 @@ fn elapsed_ordinary_burst_yields_before_selecting_the_next_job() -> Result<()> {
 }
 
 #[test]
+fn persisted_frontier_makes_a_bounded_burst_between_slow_retries() -> Result<()> {
+    for baseline in [false, true] {
+        let _clock = SchedulerClock::start();
+        let mut f = Fixture::new()?;
+        f.baseline(vec![])?;
+        let future = format!("{}/future-retry", f.root);
+        let deadline = now() + 300.0;
+        {
+            let state = f.index.lock()?;
+            for n in 0..320 {
+                state.queue(
+                    &format!("{}/frontier-{n:03}", f.root),
+                    "disk",
+                    true,
+                    baseline,
+                    0.0,
+                    true,
+                )?;
+            }
+            for n in 0..2 {
+                state.queue(
+                    &format!("{}/other-{n}", f.root),
+                    "disk",
+                    true,
+                    !baseline,
+                    0.0,
+                    true,
+                )?;
+                let failed = format!("{}/failed-{n}", f.root);
+                state.queue(&failed, "disk", true, false, 0.0, true)?;
+                state.db.execute(
+                    "UPDATE jobs SET attempts=9,error='slow provider' WHERE path=?",
+                    [&failed],
+                )?;
+                f.scan.results.insert(
+                    failed.clone(),
+                    ScanResult {
+                        scope: failed.clone(),
+                        errors: vec![ScanError {
+                            path: failed,
+                            error: "slow provider".into(),
+                            errno: Some(libc::ETIMEDOUT),
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+            state.queue(&future, "disk", true, false, deadline, true)?;
+            state.db.execute(
+                "UPDATE jobs SET attempts=9,error='future provider' WHERE path=?",
+                [&future],
+            )?;
+        }
+        f.reopen()?;
+        for _ in 0..400 {
+            let index = f.index.clone();
+            f.scan.during = Some(Box::new(move || {
+                let failed = index
+                    .lock()?
+                    .active_job
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .contains("/failed-");
+                SchedulerClock::advance(if failed {
+                    Duration::from_secs(15)
+                } else {
+                    Duration::from_millis(4)
+                });
+                Ok(())
+            }));
+            assert!(f.index.work(&mut f.scan)?);
+            if f.scan
+                .calls
+                .iter()
+                .filter(|path| path.contains("/failed-"))
+                .count()
+                == 2
+            {
+                break;
+            }
+        }
+        let failures: Vec<_> = f
+            .scan
+            .calls
+            .iter()
+            .enumerate()
+            .filter_map(|(position, path)| path.contains("/failed-").then_some(position))
+            .collect();
+        assert_eq!(
+            failures.len(),
+            2,
+            "due retries must still receive bounded service"
+        );
+        let healthy = f
+            .scan
+            .calls
+            .split(|path| path.contains("/failed-"))
+            .map(|burst| {
+                burst
+                    .iter()
+                    .filter(|path| path.contains("/frontier-"))
+                    .count()
+            })
+            .max()
+            .unwrap();
+        assert!(
+            healthy >= 200,
+            "cheap persisted work received only {healthy} turns per retry interval: baseline={baseline}"
+        );
+        assert!(
+            healthy < 320,
+            "a frontier burst must yield while more healthy work remains"
+        );
+        assert_eq!(
+            f.scan
+                .calls
+                .iter()
+                .filter(|path| path.contains("/other-"))
+                .count(),
+            2
+        );
+        assert!(!f.scan.calls.contains(&future));
+        assert_eq!(
+            f.index.lock()?.db.query_row(
+                "SELECT next_attempt FROM jobs WHERE path=?",
+                [&future],
+                |row| row.get::<_, f64>(0)
+            )?,
+            deadline
+        );
+        f.drain()?;
+        assert_eq!(
+            f.scan
+                .calls
+                .iter()
+                .filter(|path| path.contains("/frontier-"))
+                .count(),
+            320
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn baseline_and_frontier_share_one_time_budget_before_a_fresh_event() -> Result<()> {
+    for elapsed in [Duration::from_millis(500), Duration::from_secs(15)] {
+        let _clock = SchedulerClock::start();
+        let mut f = Fixture::new()?;
+        f.baseline(vec![])?;
+        for n in 0..4 {
+            let state = f.index.lock()?;
+            state.queue(
+                &format!("{}/baseline-{n}", f.root),
+                "disk",
+                true,
+                true,
+                0.0,
+                true,
+            )?;
+            state.queue(
+                &format!("{}/frontier-{n}", f.root),
+                "disk",
+                true,
+                false,
+                0.0,
+                true,
+            )?;
+        }
+        f.reopen()?;
+        f.scan.during = Some(Box::new(move || {
+            SchedulerClock::advance(elapsed);
+            Ok(())
+        }));
+        assert!(f.index.work(&mut f.scan)?);
+        assert!(f.scan.calls[0].contains("/baseline-"));
+        let fresh = format!("{}/fresh", f.root);
+        f.index.enqueue(
+            "disk",
+            &[event(&format!("{fresh}/file"), 1, CREATED | IS_FILE)],
+        )?;
+        if elapsed < ORDINARY_BURST_TIME {
+            f.scan.during = Some(Box::new(move || {
+                SchedulerClock::advance(elapsed);
+                Ok(())
+            }));
+            assert!(f.index.work(&mut f.scan)?);
+            assert!(f.scan.calls.last().unwrap().contains("/frontier-"));
+        }
+        assert!(f.index.work(&mut f.scan)?);
+        assert_eq!(
+            f.scan.calls.last(),
+            Some(&fresh),
+            "switching background classes must not renew their shared time budget"
+        );
+        assert!(f.index.status()?["pending_jobs"].as_u64().unwrap() > 0);
+        f.drain()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn ordinary_fifo_serves_a_cold_directory_while_a_short_path_keeps_arriving() -> Result<()> {
     for baseline_hot in [false, true] {
         let mut f = Fixture::new()?;
@@ -1628,6 +2375,57 @@ fn ordinary_fifo_serves_a_cold_directory_while_a_short_path_keeps_arriving() -> 
         assert!(f.paths()?.contains(&file));
         assert_eq!(f.index.cursor("disk")?, Some(3));
         f.drain()?;
+        assert_eq!(f.index.status()?["baseline_complete"], true);
+    }
+    Ok(())
+}
+
+#[test]
+fn skipped_ordinary_fifo_serves_a_cold_directory_during_hot_events() -> Result<()> {
+    for baseline_hot in [false, true] {
+        let mut f = Fixture::new()?;
+        f.baseline(vec![])?;
+        let hot = format!("{}/a", f.root);
+        let cold = format!("{}/longer-directory/waiting-for-its-turn", f.root);
+        let file = format!("{cold}/changed");
+        f.scan.results.insert(
+            hot.clone(),
+            ScanResult {
+                scope: hot.clone(),
+                traversal_skipped: true,
+                ..Default::default()
+            },
+        );
+        f.observed(&cold, vec![entry(&file, "file", 1)]);
+        if baseline_hot {
+            f.index
+                .lock()?
+                .queue(&hot, "disk", true, true, 0.0, false)?;
+        }
+        f.index.enqueue(
+            "disk",
+            &[event(&format!("{hot}/changed"), 1, CREATED | IS_FILE)],
+        )?;
+        f.index
+            .request_reconcile(Some(std::slice::from_ref(&cold)))?;
+        for id in 2..=3 {
+            let index = f.index.clone();
+            let arriving = format!("{hot}/changed");
+            f.scan.during = Some(Box::new(move || {
+                index.enqueue("disk", &[event(&arriving, id, CREATED | IS_FILE)])
+            }));
+            assert!(f.index.work(&mut f.scan)?);
+        }
+        assert_eq!(
+            f.scan.calls,
+            [hot.clone(), cold],
+            "a skipped observation must yield to cold work while retaining newer events"
+        );
+        assert!(f.paths()?.contains(&file));
+        assert_eq!(f.index.cursor("disk")?, Some(3));
+        assert!(f.index.status()?["pending_jobs"].as_u64().unwrap() > 0);
+        f.drain()?;
+        assert_eq!(f.index.status()?["pending_jobs"], 0);
         assert_eq!(f.index.status()?["baseline_complete"], true);
     }
     Ok(())
@@ -1923,7 +2721,8 @@ fn live_bursts_leave_finite_turns_for_failed_backlog_and_baseline_work() -> Resu
     let failed = format!("{}/failed", f.root);
     {
         let state = f.index.lock()?;
-        for n in 0..8 {
+        // Keep both bulk classes ready through two full live/frontier bursts.
+        for n in 0..ORDINARY_BURST_LIMIT * 3 {
             state.queue(
                 &format!("{}/backlog-{n}", f.root),
                 "disk",
@@ -1961,7 +2760,8 @@ fn live_bursts_leave_finite_turns_for_failed_backlog_and_baseline_work() -> Resu
         },
     );
     let live = format!("{}/live", f.root);
-    for id in 0..ORDINARY_BURST_LIMIT * 2 + 8 {
+    let rotation_bound = ORDINARY_BURST_LIMIT * 2 + 1;
+    for id in 0..rotation_bound * 2 + 8 {
         f.index
             .lock()?
             .db
@@ -1976,7 +2776,7 @@ fn live_bursts_leave_finite_turns_for_failed_backlog_and_baseline_work() -> Resu
         )?;
         assert!(f.index.work(&mut f.scan)?);
     }
-    for window in f.scan.calls.windows(ORDINARY_BURST_LIMIT as usize + 3) {
+    for window in f.scan.calls.windows(rotation_bound as usize) {
         assert!(window.contains(&failed), "failed class starved");
         assert!(
             window.iter().any(|path| path.contains("/backlog-")),
@@ -2165,6 +2965,263 @@ fn event_intake_and_observation_commit_never_probe_filesystem_policy() -> Result
 }
 
 #[test]
+fn hidden_policy_upgrade_prunes_saved_work_without_resetting_allowed_state() -> Result<()> {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::policy::FORBID_FILESYSTEM.set(false);
+        }
+    }
+    for through_sources in [false, true] {
+        let mut f = Fixture::new()?;
+        let visible = format!("{}/Documents", f.root);
+        let hidden = format!("{visible}/.venv");
+        let selected = format!("{}/.archive/data", f.root);
+        let roots = vec![f.root.clone(), selected.clone()];
+        f.volume.roots = roots.clone();
+        f.index
+            .configure("signature", &[f.volume.clone()], &roots)?;
+        f.index.seed_cursor("disk", 83)?;
+        {
+            let state = f.index.lock()?;
+            state
+                .db
+                .execute("DELETE FROM meta WHERE key='hidden_directory_policy'", [])?;
+            for (n, (path, kind)) in [
+                (visible.clone(), "directory"),
+                (format!("{visible}/report.txt"), "file"),
+                (format!("{visible}/.notes"), "file"),
+                (hidden.clone(), "directory"),
+                (format!("{hidden}/cache"), "file"),
+                (selected.clone(), "directory"),
+                (format!("{selected}/document"), "file"),
+                (format!("{selected}/.cache"), "directory"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                state.observe_entry(&entry(&path, kind, n as u64))?;
+            }
+            for path in [&visible, &hidden, &selected] {
+                state.db.execute(
+                    "INSERT INTO jobs(path,volume_key,recursive) VALUES (?,'disk',1)",
+                    [path],
+                )?;
+                state
+                    .db
+                    .execute("INSERT INTO directories VALUES (?)", [path])?;
+            }
+            state
+                .db
+                .execute("INSERT INTO deferred_jobs VALUES (?,'disk',1,0)", [&hidden])?;
+            for path in [&visible, &hidden] {
+                let job: Job = state.db.query_row(
+                    "SELECT *, 0 AS ready_class FROM jobs WHERE path=?",
+                    [path],
+                    Job::from_row,
+                )?;
+                state.db.execute(
+                    "INSERT INTO scan_runs VALUES (?,'saved',?)",
+                    params![path, serde_json::to_string(&job)?],
+                )?;
+                state.db.execute(
+                    "INSERT INTO scan_seen VALUES (?,?)",
+                    params![path, format!("{path}/child")],
+                )?;
+            }
+        }
+        let _restore = Restore;
+        crate::policy::FORBID_FILESYSTEM.set(true);
+        let policy = policy(roots.clone());
+        if through_sources {
+            f.index
+                .configure_policy("signature", &[f.volume.clone()], &roots, policy)?;
+        } else {
+            f.index.bind_policy(policy)?;
+        }
+        assert_eq!(f.index.cursor("disk")?, Some(83));
+        assert_eq!(
+            f.paths()?,
+            BTreeSet::from([
+                visible.clone(),
+                format!("{visible}/report.txt"),
+                format!("{visible}/.notes"),
+                selected.clone(),
+                format!("{selected}/document"),
+            ])
+        );
+        let state = f.index.lock()?;
+        for table in ["jobs", "directories", "scan_runs"] {
+            assert!(!state.db.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE path=?)"),
+                [&hidden],
+                |row| row.get::<_, bool>(0)
+            )?);
+            assert!(state.db.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE path=?)"),
+                [&visible],
+                |row| row.get::<_, bool>(0)
+            )?);
+        }
+        assert_eq!(
+            state
+                .db
+                .query_row("SELECT COUNT(*) FROM deferred_jobs", [], |row| row
+                    .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            state.db.query_row(
+                "SELECT COUNT(*) FROM scan_seen WHERE scope=?",
+                [&hidden],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hidden_directory_events_never_enter_the_durable_frontier() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.baseline(vec![])?;
+    let hidden = format!("{}/.ghost-alice", f.root);
+    f.index
+        .enqueue("disk", &[event(&hidden, 84, CREATED | IS_DIR)])?;
+    assert_eq!(f.index.cursor("disk")?, Some(84));
+    assert_eq!(f.index.status()?["pending_jobs"], 0);
+    Ok(())
+}
+
+#[test]
+fn hidden_policy_pruning_failure_rolls_back_saved_state_and_policy_binding() -> Result<()> {
+    let f = Fixture::new()?;
+    let hidden = format!("{}/.ghost-alice", f.root);
+    f.index.seed_cursor("disk", 85)?;
+    {
+        let state = f.index.lock()?;
+        state
+            .db
+            .execute("DELETE FROM meta WHERE key='hidden_directory_policy'", [])?;
+        state.observe_entry(&entry(&hidden, "directory", 1))?;
+        state.observe_entry(&entry(&format!("{hidden}/cache"), "file", 2))?;
+        state
+            .db
+            .execute("INSERT INTO directories VALUES (?)", [&hidden])?;
+        state.db.execute(
+            "INSERT INTO jobs(path,volume_key,recursive) VALUES (?,'disk',1)",
+            [&hidden],
+        )?;
+        state.db.execute_batch("CREATE TEMP TRIGGER reject_hidden_prune BEFORE DELETE ON entry_data BEGIN SELECT RAISE(ABORT,'fixture pruning failure'); END;")?;
+    }
+    assert!(
+        f.index
+            .bind_policy(policy(vec![
+                f.root.clone(),
+                format!("{}/Documents", f.root)
+            ]))
+            .is_err()
+    );
+    assert_eq!(
+        f.index.current_policy()?.unwrap().roots,
+        vec![f.root.clone()]
+    );
+    assert_eq!(f.index.cursor("disk")?, Some(85));
+    assert!(f.paths()?.contains(&hidden));
+    let state = f.index.lock()?;
+    for table in ["directories", "jobs"] {
+        assert!(state.db.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE path=?)"),
+            [&hidden],
+            |row| row.get::<_, bool>(0)
+        )?);
+    }
+    assert_eq!(
+        state.get::<Value>("hidden_directory_policy", Value::Null)?,
+        Value::Null
+    );
+    Ok(())
+}
+
+#[test]
+fn hidden_policy_upgrade_preserves_an_explicit_dormant_nested_root() -> Result<()> {
+    assert_hidden_dormant_root_preserved(true)
+}
+
+#[test]
+fn direct_policy_binding_preserves_an_explicit_dormant_hidden_root() -> Result<()> {
+    assert_hidden_dormant_root_preserved(false)
+}
+
+fn assert_hidden_dormant_root_preserved(prepare_sources: bool) -> Result<()> {
+    let f = Fixture::new()?;
+    let selected = format!("{}/.archive/data", f.root);
+    let hidden = format!("{selected}/.cache");
+    let roots = vec![f.root.clone(), selected.clone()];
+    let config = crate::config::Config {
+        roots: roots.clone(),
+        ..Default::default()
+    };
+    let nested = Volume {
+        key: "nested".into(),
+        uuid: "nested-uuid".into(),
+        device: 2,
+        mount: selected.clone(),
+        roots: vec![selected.clone()],
+    };
+    f.index.configure_policy(
+        &config.signature(),
+        &[f.volume.clone(), nested],
+        &roots,
+        policy(roots.clone()),
+    )?;
+    f.index.seed_cursor("nested", 86)?;
+    {
+        let state = f.index.lock()?;
+        state
+            .db
+            .execute("DELETE FROM meta WHERE key='hidden_directory_policy'", [])?;
+        state.observe_entry(&entry(&selected, "directory", 1))?;
+        state.observe_entry(&entry(&format!("{selected}/document"), "file", 2))?;
+        state.observe_entry(&entry(&hidden, "directory", 3))?;
+        state.observe_entry(&entry(&format!("{hidden}/cache"), "file", 4))?;
+        state.db.execute(
+            "INSERT INTO jobs(path,volume_key,recursive) VALUES (?,'nested',1)",
+            [&selected],
+        )?;
+    }
+    if prepare_sources {
+        f.index.prepare_sources(
+            &config,
+            std::slice::from_ref(&f.volume),
+            &roots,
+            policy(vec![f.root.clone()]),
+            &BTreeSet::from([f.volume.key.clone()]),
+        )?;
+    } else {
+        f.index.bind_policy(policy(vec![f.root.clone()]))?;
+    }
+    assert!(
+        f.paths()?.contains(&selected),
+        "explicit dormant hidden root is still selected"
+    );
+    assert!(f.paths()?.contains(&format!("{selected}/document")));
+    assert!(
+        !f.paths()?.contains(&hidden),
+        "hidden descendants are excluded even while dormant"
+    );
+    assert_eq!(f.index.cursor("nested")?, Some(86));
+    assert!(f.index.lock()?.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE path=?)",
+        [&selected],
+        |row| row.get::<_, bool>(0)
+    )?);
+    assert_eq!(f.index.current_policy()?.unwrap().roots, vec![f.root]);
+    Ok(())
+}
+
+#[test]
 fn dormant_nested_root_is_not_pruned_by_its_available_parent() -> Result<()> {
     let mut f = Fixture::new()?;
     let nested_root = format!("{}/nested", f.root);
@@ -2275,6 +3332,72 @@ fn an_event_between_scan_chunks_retains_its_own_generation() -> Result<()> {
         1,
         "finishing an older snapshot cannot acknowledge a later event"
     );
+    Ok(())
+}
+
+#[test]
+fn skipped_partial_scan_preserves_entries_and_a_newer_generation() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let old = format!("{}/old", f.root);
+    let observed = format!("{}/observed", f.root);
+    f.baseline(vec![entry(&old, "file", 1)])?;
+    f.index.request_reconcile(Some(&[f.root.clone()]))?;
+    f.scan.results.insert(
+        f.root.clone(),
+        ScanResult {
+            scope: f.root.clone(),
+            entries: vec![entry(&observed, "file", 2)],
+            scan_id: Some("skipped-scan".into()),
+            complete: false,
+            ..Default::default()
+        },
+    );
+    assert!(f.index.work(&mut f.scan)?);
+    f.index.enqueue(
+        "disk",
+        &[event(&format!("{}/late", f.root), 123, CREATED | IS_FILE)],
+    )?;
+    let pending_generation: i64 = f.index.lock()?.db.query_row(
+        "SELECT generation FROM jobs WHERE path=?",
+        [&f.root],
+        |r| r.get(0),
+    )?;
+    let before = f.index.status()?;
+    f.scan.results.insert(
+        f.root.clone(),
+        ScanResult {
+            scope: f.root.clone(),
+            scan_id: Some("skipped-scan".into()),
+            traversal_skipped: true,
+            ..Default::default()
+        },
+    );
+    assert!(f.index.work(&mut f.scan)?);
+    assert_eq!(f.paths()?, BTreeSet::from([old, observed]));
+    assert_eq!(f.index.status()?["pending_jobs"], 1);
+    assert_eq!(f.index.status()?["subtree_scans"], before["subtree_scans"]);
+    {
+        let state = f.index.lock()?;
+        assert_eq!(
+            state
+                .db
+                .query_row("SELECT generation FROM jobs WHERE path=?", [&f.root], |r| r
+                    .get::<_, i64>(0))?,
+            pending_generation
+        );
+        for table in ["scan_runs", "scan_seen"] {
+            assert_eq!(
+                state
+                    .db
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))?,
+                0
+            );
+        }
+    }
+    f.scan.results.get_mut(&f.root).unwrap().scan_id = None;
+    assert!(f.index.work(&mut f.scan)?);
+    assert!(!f.index.work(&mut f.scan)?);
     Ok(())
 }
 
@@ -2469,6 +3592,152 @@ fn baseline_children_from_earlier_chunks_remain_in_durable_frontier() -> Result<
 
 #[cfg(feature = "normalizer")]
 #[test]
+fn real_package_children_do_not_keep_the_worker_busy() -> Result<()> {
+    let f = Fixture::new()?;
+    let app = format!("{}/Editor.app", f.root);
+    let framework = format!("{}/Kit.framework", f.root);
+    let sibling = format!("{}/ordinary", f.root);
+    for path in [&app, &framework, &sibling] {
+        std::fs::create_dir(path)?;
+        std::fs::write(format!("{path}/file"), "fixture")?;
+    }
+    let mut normalizer =
+        crate::normalizer::Normalizer::new(f.scan.policy.clone(), None, None, None, false)?;
+    f.index.bootstrap_jobs()?;
+    for _ in 0..32 {
+        if !f.index.work(&mut normalizer)? {
+            break;
+        }
+    }
+    assert_eq!(
+        f.index.status()?["pending_jobs"],
+        0,
+        "package traversal must terminate instead of repeatedly scheduling its parent"
+    );
+    assert_eq!(f.index.status()?["baseline_complete"], true);
+    assert_eq!(
+        f.paths()?,
+        BTreeSet::from([app, framework, sibling.clone(), format!("{sibling}/file")]),
+        "package entries remain indexed while their contents stay outside traversal"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "normalizer")]
+#[test]
+fn persisted_package_jobs_are_consumed_without_pruning_after_restart() -> Result<()> {
+    for baseline in [false, true] {
+        let mut f = Fixture::new()?;
+        let package = format!("{}/Editor.app", f.root);
+        std::fs::create_dir(&package)?;
+        let mut normalizer =
+            crate::normalizer::Normalizer::new(f.scan.policy.clone(), None, None, None, false)?;
+        f.index.bootstrap_jobs()?;
+        assert!(f.index.work(&mut normalizer)?);
+        let saved = f.paths()?;
+        assert!(saved.contains(&package));
+        {
+            let state = f.index.lock()?;
+            state.db.execute("DELETE FROM jobs", [])?;
+            state.queue(&package, "disk", true, baseline, 0.0, false)?;
+        }
+        f.reopen()?;
+        assert!(f.index.work(&mut normalizer)?);
+        assert_eq!(
+            f.index.status()?["pending_jobs"],
+            0,
+            "a persisted blocked job must not regenerate its parent; baseline={baseline}"
+        );
+        assert_eq!(f.paths()?, saved, "skipped traversal is not absence");
+        assert_eq!(f.index.status()?["baseline_complete"], true);
+        assert!(!f.index.work(&mut normalizer)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "normalizer")]
+#[test]
+fn package_events_observe_the_entry_without_scheduling_its_contents() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.baseline(vec![])?;
+    let package = format!("{}/Editor.APP", f.root);
+    std::fs::create_dir(&package)?;
+    f.index
+        .enqueue("disk", &[event(&package, 1, CREATED | IS_DIR)])?;
+    {
+        let state = f.index.lock()?;
+        let paths = state
+            .db
+            .prepare("SELECT path FROM jobs")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(paths, [f.root.clone()]);
+    }
+    let mut normalizer =
+        crate::normalizer::Normalizer::new(f.scan.policy.clone(), None, None, None, false)?;
+    assert!(f.index.work(&mut normalizer)?);
+    assert!(!f.index.work(&mut normalizer)?);
+    assert!(f.paths()?.contains(&package));
+    Ok(())
+}
+
+#[cfg(feature = "normalizer")]
+#[test]
+fn real_missing_or_replaced_directory_still_reconciles_its_parent() -> Result<()> {
+    for replacement in ["missing", "file", "symlink"] {
+        let f = Fixture::new()?;
+        let directory = format!("{}/directory", f.root);
+        let child = format!("{directory}/child");
+        std::fs::create_dir(&directory)?;
+        std::fs::write(&child, "fixture")?;
+        let mut normalizer =
+            crate::normalizer::Normalizer::new(f.scan.policy.clone(), None, None, None, false)?;
+        f.index.bootstrap_jobs()?;
+        for _ in 0..8 {
+            if !f.index.work(&mut normalizer)? {
+                break;
+            }
+        }
+        assert!(f.paths()?.contains(&child));
+        std::fs::remove_file(&child)?;
+        std::fs::remove_dir(&directory)?;
+        if replacement == "file" {
+            std::fs::write(&directory, "replacement")?;
+        } else if replacement == "symlink" {
+            std::os::unix::fs::symlink(f.temp.path(), &directory)?;
+        }
+        f.index
+            .request_reconcile(Some(std::slice::from_ref(&directory)))?;
+        for _ in 0..8 {
+            if !f.index.work(&mut normalizer)? {
+                break;
+            }
+        }
+        assert_eq!(
+            f.index.status()?["pending_jobs"],
+            0,
+            "replacement={replacement}"
+        );
+        assert!(
+            !f.paths()?.contains(&child),
+            "stale child survives {replacement}"
+        );
+        if replacement == "missing" {
+            assert!(!f.paths()?.contains(&directory));
+        } else {
+            let kind: String = f.index.lock()?.db.query_row(
+                "SELECT kind FROM entries WHERE path=?",
+                [&directory],
+                |r| r.get(0),
+            )?;
+            assert_eq!(kind, replacement);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "normalizer")]
+#[test]
 fn a_real_wide_directory_yields_to_a_fresh_directory_event() -> Result<()> {
     let mut f = Fixture::new()?;
     let wide = format!("{}/wide", f.root);
@@ -2517,6 +3786,58 @@ fn a_real_wide_directory_yields_to_a_fresh_directory_event() -> Result<()> {
             .count(),
         600
     );
+    Ok(())
+}
+
+#[cfg(feature = "normalizer")]
+#[test]
+fn many_real_wide_directories_finish_without_restarting_prefix_snapshots() -> Result<()> {
+    for baseline in [false, true] {
+        let mut f = Fixture::new()?;
+        f.baseline(vec![])?;
+        let mut expected = BTreeSet::new();
+        for n in 0..16 {
+            let directory = format!("{}/wide-{n:02}", f.root);
+            std::fs::create_dir(&directory)?;
+            for child in 0..129 {
+                let path = format!("{directory}/file-{child:03}");
+                std::fs::write(&path, "fixture")?;
+                expected.insert(path);
+            }
+            f.index
+                .lock()?
+                .queue(&directory, "disk", true, baseline, 0.0, true)?;
+        }
+        f.reopen()?;
+        let mut normalizer =
+            crate::normalizer::Normalizer::new(f.scan.policy.clone(), None, None, None, false)?;
+        let mut snapshots = HashMap::new();
+        for _ in 0..16 * 260 {
+            if !f.index.work(&mut normalizer)? {
+                break;
+            }
+            let state = f.index.lock()?;
+            let mut statement = state.db.prepare("SELECT path,scan_id FROM scan_runs")?;
+            for row in statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (path, id) = row?;
+                if let Some(original) = snapshots.insert(path.clone(), id.clone()) {
+                    assert_eq!(
+                        id, original,
+                        "static queued directory restarted its prefix: baseline={baseline}, path={path}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            f.index.status()?["pending_jobs"],
+            0,
+            "wide-directory frontier must finish"
+        );
+        assert_eq!(f.paths()?, expected);
+        assert!(normalizer.active_scans().is_empty());
+    }
     Ok(())
 }
 
@@ -2660,5 +3981,99 @@ fn a_real_wide_alias_scan_restarts_after_index_reset() -> Result<()> {
     }
     assert_eq!(f.index.status()?["pending_jobs"], 0);
     assert_eq!(f.paths()?.len(), 600);
+    Ok(())
+}
+
+#[test]
+fn current_status_excludes_dormant_work_but_preserves_diagnostic_totals() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.baseline(vec![entry(&format!("{}/saved", f.root), "file", 1)])?;
+    f.index.seed_cursor("disk", 81)?;
+    let state = f.index.lock()?;
+    state.db.execute("INSERT INTO jobs (path, volume_key, recursive, baseline, attempts, next_attempt, error) VALUES (?, 'disk', 1, 1, 2, 123, 'unplugged')", [&f.root])?;
+    state.db.execute(
+        "INSERT INTO deferred_jobs VALUES ('/deferred', 'disk', 1, 1)",
+        [],
+    )?;
+    state.set(
+        "pending_baseline_roots",
+        &BTreeMap::from([(f.root.clone(), "disk".to_string())]),
+    )?;
+    state.set("needs_revalidation", &true)?;
+    state.set("revalidation_keys", &vec!["disk"])?;
+    state
+        .db
+        .execute("INSERT INTO inactive_volumes VALUES ('disk')", [])?;
+    state.refresh_baseline()?;
+    drop(state);
+    let before = f.index.status()?;
+    assert_eq!(before["pending_jobs"], 2);
+    assert_eq!(before["directory_retry_count"], 1);
+    assert_eq!(before["baseline_complete"], false);
+    let current = &before["current"];
+    assert_eq!(current["pending_jobs"], 0);
+    assert_eq!(current["deferred_jobs"], 0);
+    assert_eq!(current["next_retry"], Value::Null);
+    assert_eq!(current["directory_retry_count"], 0);
+    assert_eq!(current["directory_retry_items"], json!([]));
+    assert_eq!(current["pending_baseline_roots"], json!([]));
+    assert_eq!(current["baseline_complete"], true);
+    assert_eq!(current["needs_revalidation"], false);
+    let reopened = Index::new(&f.path, true)?;
+    assert_eq!(reopened.status()?, before);
+    f.index.activate_volume("disk")?;
+    let after = f.index.status()?;
+    assert_eq!(after["current"]["pending_jobs"], 2);
+    assert_eq!(after["current"]["directory_retry_count"], 1);
+    assert_eq!(after["current"]["baseline_complete"], false);
+    assert_eq!(after["current"]["needs_revalidation"], true);
+    assert_eq!(after["cursors"], before["cursors"]);
+    assert_eq!(after["indexed_entries"], before["indexed_entries"]);
+    Ok(())
+}
+
+#[test]
+fn current_retry_deadline_ignores_ordinary_scheduled_work() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.baseline(vec![])?;
+    {
+        let state = f.index.lock()?;
+        state.db.execute("INSERT INTO jobs (path, volume_key, recursive, next_attempt) VALUES (?, 'disk', 0, 10)", [&f.root])?;
+        state.db.execute(
+            "INSERT INTO deferred_jobs VALUES ('/queued', 'disk', 1, 0)",
+            [],
+        )?;
+    }
+    let ordinary = f.index.status()?;
+    assert_eq!(
+        ordinary["next_retry"], 10.0,
+        "legacy diagnostics retain scheduler deadlines"
+    );
+    assert_eq!(
+        ordinary["current"]["next_retry"],
+        Value::Null,
+        "fresh queued work has never failed"
+    );
+    assert_eq!(ordinary["current"]["pending_jobs"], 2);
+    assert_eq!(ordinary["current"]["directory_retry_count"], 0);
+    {
+        let state = f.index.lock()?;
+        state.db.execute("INSERT INTO jobs (path, volume_key, recursive, attempts, next_attempt, error) VALUES ('/failed', 'disk', 0, 2, 20, 'Permission denied')", [])?;
+        state.db.execute("INSERT INTO jobs (path, volume_key, recursive, attempts, next_attempt, error) VALUES ('/dormant', 'offline', 0, 2, 5, 'Unplugged')", [])?;
+        state
+            .db
+            .execute("INSERT INTO inactive_volumes VALUES ('offline')", [])?;
+    }
+    let failed = f.index.status()?;
+    assert_eq!(failed["next_retry"], 5.0);
+    assert_eq!(failed["pending_jobs"], 4);
+    assert_eq!(failed["current"]["next_retry"], 20.0);
+    assert_eq!(failed["current"]["pending_jobs"], 3);
+    assert_eq!(failed["current"]["directory_retry_count"], 1);
+    assert_eq!(
+        failed["current"]["directory_retry_items"][0]["path"],
+        "/failed"
+    );
+    assert_eq!(Index::new(&f.path, true)?.status()?, failed);
     Ok(())
 }

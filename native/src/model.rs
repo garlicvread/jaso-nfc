@@ -32,6 +32,9 @@ pub struct ScanResult {
     /// False means this job must yield and resume without negative inference.
     #[serde(default = "scan_complete")]
     pub complete: bool,
+    /// Policy refused the requested scope; this proves no filesystem absence.
+    #[serde(default)]
+    pub traversal_skipped: bool,
 }
 
 fn scan_complete() -> bool {
@@ -48,6 +51,7 @@ impl Default for ScanResult {
             renamed: 0,
             scan_id: None,
             complete: true,
+            traversal_skipped: false,
         }
     }
 }

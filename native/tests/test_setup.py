@@ -42,11 +42,28 @@ class SetupCLI(unittest.TestCase):
 
     def test_read_returns_exact_draft_and_revision_without_writing(self):
         result = self.call("read")
-        self.assertEqual(result["config"], json.loads(self.draft()))
+        self.assertEqual(result["config"], {**json.loads(self.draft()),
+                         "drives": {"mode": "automatic", "included": [], "excluded": []}})
+        self.assertIsInstance(result["drive_inventory"], list)
         self.assertEqual(len(result["revision"]), 64)
         self.assertFalse(result["running"])
         self.assertFalse(result["paused"])
         self.assertEqual(self.config.read_bytes(), self.bytes)
+        self.assertFalse(self.state.exists())
+
+    def test_read_retains_disconnected_drive_choices_without_writing(self):
+        choices = {"mode": "selected", "included": [{"uuid": "offline-python-test",
+                   "mount": "/Volumes/Offline Python Test"}], "excluded": []}
+        self.config.write_text(json.dumps({**self.original, "drives": choices}))
+        before = self.config.read_bytes()
+        result = self.call("read")
+        self.assertEqual(result["config"]["drives"], choices)
+        self.assertIn({"uuid": "offline-python-test", "mount": "/Volumes/Offline Python Test",
+                           "name": "Offline Python Test", "connected": False, "included": True,
+                           "availability": "disconnected",
+                       "reconnect": "automatic"},
+                      result["drive_inventory"])
+        self.assertEqual(self.config.read_bytes(), before)
         self.assertFalse(self.state.exists())
 
     def test_preview_returns_before_after_and_respects_retained_exclusion_names(self):
@@ -83,11 +100,23 @@ class SetupCLI(unittest.TestCase):
         self.assertFalse(result["complete"])
 
     def test_rejects_unknown_or_missing_draft_fields_without_touching_config(self):
-        for draft in [{"scope": "configured"}, {**json.loads(self.draft()), "state_dir": "/other"},
-                      {**json.loads(self.draft()), "roots": []}]:
+        for draft in [{"scope": "configured"}, {**json.loads(self.draft()), "state_dir": "/other"}]:
             with self.subTest(draft=draft):
                 self.call("preview", "--draft", json.dumps(draft), success=False)
         self.assertEqual(self.config.read_bytes(), self.bytes)
+
+    def test_preview_after_removing_last_folder_has_no_work(self):
+        before = unicodedata.normalize("NFD", "보고서.txt")
+        (self.root / before).write_bytes(b"previously selected file")
+        result = self.call("preview", "--draft", self.draft(roots=[]))
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["entries"], 0)
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["interrupted_checks"], [])
+        self.assertEqual(self.config.read_bytes(), self.bytes)
+        self.assertEqual(os.listdir(self.root), [before])
+        self.assertFalse(self.state.exists())
 
     def test_save_rejects_stale_revision_before_lifecycle_or_config_changes(self):
         error = self.call("save", "--draft", self.draft(apply=False),

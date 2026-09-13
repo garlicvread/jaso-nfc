@@ -2,11 +2,11 @@
 
 [한국어 사용 설명서](usage.md) · [English user guide](usage.en.md)
 
-[다운로드 / Download](https://github.com/garlicvread/jaso-nfc/releases/download/v0.1.0/Jaso-NFC-0.1.0-arm64-local.dmg) · [릴리스 정보 / Release notes](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.1.0)
+[다운로드 / Download](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.0/Jaso-NFC-0.2.0-arm64-local.dmg) · [릴리스 정보 / Release notes](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.2.0)
 
-0.1.0 · Apple Silicon Mac · macOS 13 이상 / macOS 13 or later
+0.2.0 · Apple Silicon Mac · macOS 13 이상 / macOS 13 or later
 
-## Graphical installation package
+## 설치하기 / Install the app
 
 ### 한국어
 
@@ -14,7 +14,7 @@
 2. `설치`를 누른 뒤 완료될 때까지 창을 열어 두세요.
 3. `설치 파일 유지` 또는 `설치 파일 휴지통 이동`을 선택하세요. 휴지통 이동 대상은 원본 DMG입니다.
 4. 설치 창을 닫고 Finder에서 설치 디스크를 추출하세요.
-5. Jaso NFC의 `정리할 폴더…`에서 폴더를 선택하고 `파일명 미리보기`를 실행하세요. 결과를 확인한 뒤 `자동 정리 시작`을 누르세요.
+5. 메뉴 막대의 `Jaso NFC 열기…`를 선택한 뒤 `폴더`에서 폴더를 선택하고 `파일명 미리보기`를 실행하세요. 결과를 확인한 뒤 `자동 정리 시작`을 누르세요.
 
 앱은 `/Applications/Jaso NFC.app`에 설치됩니다. 새 설치는 다운로드 폴더를 제안하며, 업데이트는 저장된 폴더와 제외 설정을 이어서 사용합니다. 설치 권한 오류가 표시되면 응용 프로그램 폴더에 쓸 권한이 있는 계정을 사용하거나 Mac 관리자에게 문의하세요.
 
@@ -24,7 +24,7 @@
 2. Choose `Install` and keep the window open until it finishes.
 3. Choose `Keep Installer` or `Move Installer to Trash`. The Trash action applies to the original DMG.
 4. Close the installer and eject its mounted disk in Finder.
-5. Open `Manage folders…` in Jaso NFC, select your folders, and choose `Preview filenames`. Review the result, then choose `Start automatic cleanup`.
+5. Choose `Open Jaso NFC…` from the menu bar, select `Folders`, choose your folders, and choose `Preview filenames`. Review the result, then choose `Start automatic cleanup`.
 
 The app is installed at `/Applications/Jaso NFC.app`. A fresh installation suggests Downloads; an update continues with saved folders and exclusions. For an installation permission error, use an account that can write to Applications or contact the Mac's administrator.
 
@@ -42,9 +42,9 @@ After checking that you trust the download, follow [Apple's app opening instruct
 
 ## Folder setup
 
-일상적인 설정은 앱의 `정리할 폴더…`에서 진행하세요. 폴더와 제외 항목을 선택한 뒤 `파일명 미리보기`로 변경할 이름을 확인하고 `자동 정리 시작`을 누르면 됩니다. 자세한 순서는 [사용 설명서](usage.md#파일명-변경-켜기)를 참고하세요.
+일상적인 설정은 앱의 `폴더`에서 진행하세요. 폴더와 제외 항목을 선택한 뒤 `파일명 미리보기`로 변경할 이름을 확인하고 `자동 정리 시작`을 누르면 됩니다. 자세한 순서는 [사용 설명서](usage.md#파일명-변경-켜기)를 참고하세요.
 
-For everyday setup, use `Manage folders…` in the app. Choose folders and exclusions, review `Preview filenames`, then choose `Start automatic cleanup`. Follow the [user guide](usage.en.md#enable-filename-changes) for the full walkthrough.
+For everyday setup, select `Folders` in the app. Choose folders and exclusions, review `Preview filenames`, then choose `Start automatic cleanup`. Follow the [user guide](usage.en.md#enable-filename-changes) for the full walkthrough.
 
 ### Advanced CLI alternative
 
@@ -115,21 +115,21 @@ Language, appearance, and content size are stored through macOS preferences. For
 
 One per-user LaunchAgent at `~/Library/LaunchAgents/io.github.garlicvread.jaso-nfc.plist` runs the installed executable with `run --config <path>`. That worker starts the native menu. The earlier separate menu registration is removed during migration. The installer retains a recovery copy at `releases/<version>-native-<digest>/Jaso NFC.app`.
 
-Opening the app loads the configuration selected by the installed registration, including custom state paths. If registration files disagree or contain an invalid configuration path, resolve that error before installing again. After Quit, open the app and choose `Start worker` to continue processing.
+Opening the app loads the configuration selected by the installed registration, including custom state paths. If registration files disagree or contain an invalid configuration path, resolve that error before installing again. After Quit, open the app and choose the start action in `Status` to continue processing.
 
 ## Permissions
 
 권한 오류가 표시되면 아래 순서로 확인하세요.
 
-1. `설정…` → `전체 디스크 접근 권한 열기…`에서 `+`로 `/Applications/Jaso NFC.app`을 추가하고 허용하세요. 항목이 추가되지 않으면 Finder에서 설치된 앱을 목록으로 끌어 넣으세요.
+1. `설정` → `상세 설정` → `전체 디스크 접근 권한 열기…`에서 `+`로 `/Applications/Jaso NFC.app`을 추가하고 허용하세요. 항목이 추가되지 않으면 Finder에서 설치된 앱을 목록으로 끌어 넣으세요.
 2. `로그인 항목 열기…`에서 Jaso NFC의 백그라운드 실행도 확인하세요.
-3. 상태 창의 `작업 다시 시작`을 선택한 뒤 접근할 수 없는 위치를 다시 확인하세요.
+3. `설정` → `상세 설정`의 `정리 작업 다시 시작`을 선택한 뒤 접근할 수 없는 위치를 다시 확인하세요.
 
 For an access error, follow these steps:
 
-1. Choose `Settings…` → `Open Full Disk Access…`, add `/Applications/Jaso NFC.app` with `+`, and enable it. If the entry is not added, drag the installed app from Finder into the list.
+1. Choose `Settings` → `Advanced settings` → `Open Full Disk Access…`, add `/Applications/Jaso NFC.app` with `+`, and enable it. If the entry is not added, drag the installed app from Finder into the list.
 2. Check Jaso NFC's background activity through `Open Login Items…`.
-3. Choose `Restart worker` in Status, then check the unavailable locations again.
+3. Choose `Restart cleanup` in `Settings` → `Advanced settings`, then check the unavailable locations again.
 
 File ownership, locks, and volume write permissions also affect access. For another account's files, check its sharing permissions. When running CLI tests, check the terminal's access permissions too. A rebuilt app may need its permission entry updated to the new installed copy. See Apple's [filesystem permission and executable identity guidance](https://developer.apple.com/forums/thread/678819) for development details.
 
@@ -163,9 +163,9 @@ Pause and startup preferences are saved. Startup commands control future logins;
 
 ## Recovery
 
-상태 창의 `복구 기록 폴더 열기`에서 이름 변경 기록의 위치를 확인하세요. 아래 고급 명령은 지정한 기록 전체를 대상으로 되돌리기를 시도하므로 사용할 이력을 먼저 확인해 주세요.
+한 파일의 이름을 복원하려면 `변경 기록`에서 항목을 선택하고 `원래 이름으로 되돌리기`를 누르세요. [이름 복원 안내](usage.md#recovery)에서 확인 순서를 살펴보세요. 아래 고급 명령은 지정한 기록 전체를 대상으로 되돌리기를 시도하므로 사용할 이력을 먼저 확인해 주세요.
 
-Use `Open recovery history` in Status to find the name-change records. The advanced commands below attempt to revert the selected journal and its archives; review that history before proceeding.
+To restore one filename, select the item in `History` and choose `Restore original name`. Follow the [name restoration guide](usage.en.md#recovery) to review it. The advanced commands below attempt to revert the selected journal and its archives; review that history before proceeding.
 
 Disable future login startup and stop the current worker:
 

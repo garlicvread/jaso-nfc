@@ -35,9 +35,28 @@ class InstallerPackage(unittest.TestCase):
         self.assertEqual(info["CFBundleIdentifier"], "io.github.garlicvread.jaso-nfc.installer")
         self.assertEqual(info["CFBundleExecutable"], "Jaso NFC Installer")
         self.assertEqual(info["JasoPublisher"], "AidALL Inc.")
+        self.assertEqual(info["JasoContributor"], "garlicvread")
+        self.assertEqual(info["JasoContributorEmail"], "ceo@aidall.tech")
         self.assertEqual(info["JasoSupportEmail"], "aidall_manager@aidall.tech")
         self.assertTrue(os.access(self.installer / "Contents/MacOS/Jaso NFC Installer", os.X_OK))
         self.assertTrue((self.installer / "Contents/Resources/JasoNFC.icns").is_file())
+        source = plistlib.loads((PROJECT / "native/macos/Info.plist").read_bytes())
+        for key in ("CFBundleShortVersionString", "CFBundleVersion", "LSMinimumSystemVersion"):
+            self.assertEqual(info[key], source[key])
+
+    def test_package_architecture_matches_every_executable(self):
+        binaries = (self.app / "Contents/MacOS/jaso-nfc",
+                    self.app / "Contents/MacOS/Jaso NFC",
+                    self.installer / "Contents/MacOS/Jaso NFC Installer")
+        architectures = [subprocess.run(["lipo", "-archs", str(binary)], check=True,
+                                        capture_output=True, text=True).stdout.split()
+                         for binary in binaries]
+        self.assertTrue(architectures[0])
+        for architecture in architectures[1:]:
+            self.assertEqual(set(architecture), set(architectures[0]),
+                             "Installer and payload must support the same architectures")
+        version = plistlib.loads((self.app / "Contents/Info.plist").read_bytes())["CFBundleShortVersionString"]
+        self.assertEqual(PACKAGE.name, f"Jaso-NFC-{version}-{'-'.join(architectures[0])}-local.dmg")
 
     def test_payload_matches_the_tested_application(self):
         original = {str(p.relative_to(PAYLOAD)): p for p in PAYLOAD.rglob("*") if p.is_file()}
@@ -57,7 +76,8 @@ class InstallerPackage(unittest.TestCase):
     def test_getting_started_instructions_license_and_publisher(self):
         instructions = (self.mount / "READ ME FIRST.txt").read_text()
         for required in ("Double-click", "Install Jaso NFC.app", "AidALL Inc.",
-                         "aidall_manager@aidall.tech", "garlicvread", "Manage folders",
+                         "aidall_manager@aidall.tech", "garlicvread <ceo@aidall.tech>",
+                         "Open Jaso NFC…", "Folders", "Jaso NFC 열기…", "‘폴더’",
                          "Preview filenames", "Start automatic cleanup", "https://github.com/garlicvread/jaso-nfc", "설치"):
             self.assertIn(required, instructions)
         self.assertEqual((self.mount / "LICENSE.txt").read_bytes(), (PROJECT / "LICENSE").read_bytes())

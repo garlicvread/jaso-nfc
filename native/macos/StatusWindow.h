@@ -12,6 +12,7 @@
 - (void)zoomIn:(id)sender;
 - (void)zoomOut:(id)sender;
 - (void)resetZoom:(id)sender;
+- (void)reloadLocalization;
 - (void)updateSnapshot:(NSDictionary *)snapshot error:(NSString *)error updatedAt:(NSDate *)date;
 - (void)setRefreshing:(BOOL)refreshing;
 @end

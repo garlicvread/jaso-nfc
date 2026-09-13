@@ -32,6 +32,121 @@ static NSDictionary *Configuration(NSString *scope, BOOL apply) {
 static NSDictionary *Preview(void) {
     return @{@"candidates":@[@{@"path":@"/fixture/Downloads/보고서.txt", @"before":@"보고서.txt", @"after":@"보고서.txt"}], @"entries":@24, @"errors":@[], @"truncated":@NO, @"complete":@YES, @"revision":@"fixture-revision"};
 }
+static void CheckLayout(NSView *view, NSView *container);
+static void Render(JasoSetupWindowController *controller, NSString *path);
+static void CheckDegradedDriveInventory(void) {
+    JasoSetupWindowController *controller = JasoSetupWindowController.new;
+    NSDictionary *reference = @{@"uuid":@"archive-id", @"mount":@"/Volumes/Archive"};
+    NSDictionary *config = @{@"scope":@"configured", @"roots":@[@"/fixture/Documents", @"/Volumes/Archive/Work", @"/Volumes/Unknown/Work"], @"excludes":@[], @"apply":@NO, @"drives":@{@"mode":@"selected", @"included":@[reference], @"excluded":@[], @"reconnect":@[@{@"uuid":@"archive-id", @"mount":@"/Volumes/Archive", @"mode":@"manual"}]}};
+    NSArray *inventory = @[@{@"uuid":@"archive-id", @"mount":@"/Volumes/Archive", @"included":@YES, @"connected":@NO, @"availability":@"unavailable"}, @{@"uuid":@"unknown-id", @"mount":@"/Volumes/Unknown", @"included":@NO, @"connected":@YES, @"availability":@"unavailable"}];
+    NSArray *issues = @[@{@"mount":@"/Volumes/Archive", @"reason":@"Cannot read mounted drive identity: Operation canceled (os error 89)"}, @{@"mount":@"/Volumes/Unknown", @"reason":@"Cannot read mounted drive identity"}];
+    [controller updateConfiguration:@{@"config":config, @"revision":@"degraded-revision", @"drive_inventory":inventory, @"drive_inventory_issues":issues, @"drive_inventory_complete":@NO} error:nil];
+    NSTextField *warning = (id)Find(controller.window.contentView, @"setup-drive-inventory-warning");
+    Require(warning && !warning.hiddenOrHasHiddenAncestor && [warning isDescendantOf:Find(controller.window.contentView, @"setup-drives-card")], @"Partial drive failures must be shown inside Drives instead of blocking all folder settings");
+    Require(Button(controller, @"setup-add-folder").enabled && Button(controller, @"setup-preview").enabled && Button(controller, @"setup-save").enabled && [controller.revision isEqual:@"degraded-revision"], @"A degraded inventory must preserve editable folders and the configuration revision");
+    Require(!Button(controller, @"setup-add-drive").enabled, @"An unavailable identity must not be offered for inclusion even if connected is inconsistent");
+    NSTableView *table = (id)Find(controller.window.contentView, @"setup-drives");
+    Require(table.numberOfRows == 1, @"Unknown issue paths must not create managed UUID rows");
+    __block NSUInteger starts = 0; controller.startDriveHandler = ^(NSString *uuid, NSString *revision) { starts++; };
+    for (NSString *language in @[@"en", @"ko"]) {
+        [TestDefaults setObject:language forKey:@"interfaceLanguage"]; [controller reloadLocalization];
+        Require([warning.stringValue containsString:@"/Volumes/Archive"] && [warning.stringValue containsString:@"/Volumes/Unknown"] && [warning.stringValue containsString:[language isEqual:@"en"] ? @"Refresh drives" : @"드라이브 새로고침"], @"Drive warnings must include affected paths and a localized refresh action");
+        Require(![warning.stringValue containsString:@"os error 89"] && ![[(NSTextField *)Find(controller.window.contentView, @"setup-message") stringValue] containsString:@"/Volumes/Archive"], @"Raw identity diagnostics must stay outside the main setup message");
+        NSTextField *row = (id)[controller tableView:table viewForTableColumn:table.tableColumns.firstObject row:0];
+        Require([row.stringValue containsString:[language isEqual:@"en"] ? @"Unavailable" : @"확인할 수 없음"], @"Unavailable drives must be distinguished from disconnected drives");
+        [table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+        [Button(controller, @"setup-manage-drive") performClick:nil];
+        NSView *sheet = controller.window.attachedSheet.contentView;
+        NSTextField *status = (id)Find(sheet, @"setup-drive-status");
+        Require([status.stringValue containsString:[language isEqual:@"en"] ? @"Unavailable" : @"확인할 수 없음"], @"Drive details must explain that the identity check is unavailable");
+        NSButton *start = (id)Find(sheet, @"setup-start-drive"); Require(!start.enabled, @"An unavailable drive must not be started");
+        start.enabled = YES; [start performClick:nil]; Require(starts == 0, @"The drive start action must also validate current availability");
+        [(NSButton *)Find(sheet, @"setup-drive-details-cancel") performClick:nil];
+    }
+    [controller addFolderURLs:@[[NSURL fileURLWithPath:@"/fixture/New folder"]] excluding:NO];
+    NSDictionary *draft = controller.draft;
+    [controller updateDriveInventory:@{@"drive_inventory":@[], @"drive_inventory_issues":@[], @"drive_inventory_complete":@YES} error:nil];
+    Require(warning.hiddenOrHasHiddenAncestor && [controller.draft isEqual:draft], @"A successful refresh must clear drive warnings and preserve the unsaved folder draft");
+    NSMutableArray *manyIssues = NSMutableArray.new;
+    for (NSUInteger i=0; i<20; i++) [manyIssues addObject:@{@"mount":[NSString stringWithFormat:@"/Volumes/%lu/%@", (unsigned long)i, [@"Long name " stringByPaddingToLength:400 withString:@"Long name " startingAtIndex:0]], @"reason":@"Unavailable"}];
+    [controller updateDriveInventory:@{@"drive_inventory":@[], @"drive_inventory_issues":manyIssues, @"drive_inventory_complete":@NO} error:nil];
+    Require(warning.stringValue.length < 900 && [warning.stringValue containsString:@"17"], @"The drive warning must bound long mount lists and show the remaining count");
+    [controller updateConfiguration:@{@"config":@{@"scope":@"configured", @"roots":@[@"/fixture/Documents"], @"excludes":@[], @"apply":@NO}, @"revision":@"local", @"drive_inventory":@[], @"drive_inventory_issues":issues, @"drive_inventory_complete":@NO} error:nil];
+    Require(!warning.hiddenOrHasHiddenAncestor && Button(controller, @"setup-add-folder").enabled, @"A failed unknown drive must keep its warning visible while ordinary local folders remain editable");
+    [controller close]; [TestDefaults setObject:@"en" forKey:@"interfaceLanguage"];
+}
+static void CheckDriveManagement(NSString *output) {
+    NSDictionary *archive = @{@"uuid":@"archive-id", @"mount":@"/Volumes/Archive"};
+    NSDictionary *work = @{@"uuid":@"work-id", @"mount":@"/Volumes/Work"};
+    NSDictionary *newDrive = @{@"uuid":@"new-id", @"mount":@"/Volumes/New"};
+    NSMutableDictionary *configuration = [Configuration(@"all-user-files", YES) mutableCopy];
+    NSMutableDictionary *config = [configuration[@"config"] mutableCopy];
+    config[@"drives"] = @{@"mode":@"automatic", @"included":@[], @"excluded":@[newDrive]};
+    configuration[@"config"] = config;
+    configuration[@"drive_inventory"] = @[
+        @{@"uuid":@"archive-id", @"mount":@"/Volumes/Archive", @"name":@"Archive", @"connected":@NO, @"included":@YES},
+        @{@"uuid":@"work-id", @"mount":@"/Volumes/Work", @"name":@"Work", @"connected":@YES, @"included":@YES},
+        @{@"uuid":@"new-id", @"mount":@"/Volumes/New", @"name":@"New", @"connected":@YES, @"included":@NO}];
+    JasoSetupWindowController *controller = [JasoSetupWindowController new];
+    [controller updateConfiguration:configuration error:nil];
+    NSPopUpButton *mode = (NSPopUpButton *)Find(controller.window.contentView, @"setup-drive-mode");
+    NSTableView *drives = (NSTableView *)Find(controller.window.contentView, @"setup-drives");
+    Require(mode && drives, @"Drive management must be available for automatic folder discovery");
+    Require(drives.numberOfRows == 2, @"Managed drives include a disconnected remembered drive");
+    for (NSString *language in @[@"en", @"ko"]) {
+        [TestDefaults setObject:language forKey:@"interfaceLanguage"]; [controller reloadLocalization];
+        for (NSNumber *zoom in @[@1.0, @2.0]) {
+            JasoSetContentZoom(zoom.doubleValue); [controller.window setContentSize:NSMakeSize(560, 640)];
+            [controller.window.contentView layoutSubtreeIfNeeded]; CheckLayout(controller.window.contentView, controller.window.contentView);
+            if (output) {
+                [NSFileManager.defaultManager createDirectoryAtPath:output withIntermediateDirectories:YES attributes:nil error:NULL];
+                [Find(controller.window.contentView, @"setup-drives-card") scrollRectToVisible:Find(controller.window.contentView, @"setup-drives-card").bounds];
+                Render(controller, [output stringByAppendingPathComponent:[NSString stringWithFormat:@"drives-%@-%.1f.png", language, zoom.doubleValue]]);
+            }
+        }
+    }
+    JasoSetContentZoom(1); [TestDefaults setObject:@"en" forKey:@"interfaceLanguage"]; [controller reloadLocalization];
+    [drives selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+    [Button(controller, @"setup-remove-drive") performClick:nil];
+    Require(drives.numberOfRows == 1 && [controller.draft[@"drives"][@"excluded"] containsObject:archive], @"Removing a disconnected drive must suppress its future automatic inclusion");
+    Require(Button(controller, @"setup-save").enabled, @"Drive choices can be saved directly for the current cleanup mode");
+    Choose(mode, @"selected");
+    Require([controller.draft[@"drives"][@"mode"] isEqual:@"selected"] && [controller.draft[@"drives"][@"included"] isEqual:@[work]], @"Manual mode begins with the currently managed drives");
+    NSPopUpButton *add = (NSPopUpButton *)Find(controller.window.contentView, @"setup-add-drive");
+    Choose(add, @"new-id");
+    Require(drives.numberOfRows == 2 && [controller.draft[@"drives"][@"included"] containsObject:newDrive] && ![controller.draft[@"drives"][@"excluded"] containsObject:newDrive], @"Adding a connected drive restores its inclusion");
+    Require(Button(controller, @"setup-refresh-drives").enabled, @"The drive list can refresh without reloading the folder draft");
+    __block BOOL refreshed = NO;
+    controller.refreshDrivesHandler = ^{ refreshed = YES; };
+    NSDictionary *beforeRefresh = controller.draft;
+    [Button(controller, @"setup-refresh-drives") performClick:nil];
+    Require(refreshed && !mode.enabled, @"Refresh dispatches inventory loading and freezes controls");
+    NSMutableDictionary *refreshedConfiguration = [configuration mutableCopy];
+    refreshedConfiguration[@"drive_inventory"] = [configuration[@"drive_inventory"] subarrayWithRange:NSMakeRange(0, 2)];
+    [controller updateDriveInventory:refreshedConfiguration error:nil];
+    Require([controller.draft isEqual:beforeRefresh] && mode.enabled, @"Refreshing connected drives preserves unsaved removal and manual selection");
+    Require(drives.numberOfRows == 2, @"A newly selected drive remains manageable if it disconnects before saving");
+    [controller updateDriveInventory:nil error:@"Temporary drive refresh failure"];
+    [controller updateDriveInventory:refreshedConfiguration error:nil];
+    Require(![[(NSTextField *)Find(controller.window.contentView, @"setup-message") stringValue] containsString:@"Temporary drive refresh failure"] && [controller.draft isEqual:beforeRefresh], @"A successful drive refresh clears its previous error and keeps the draft");
+    __block NSDictionary *saved = nil;
+    controller.saveHandler = ^(NSDictionary *draft, NSString *revision, BOOL start) {
+        Require([revision isEqual:@"fixture-revision"] && !start, @"Drive save uses the existing revision and lifecycle transaction"); saved = draft;
+    };
+    [Button(controller, @"setup-save") performClick:nil];
+    Require(saved && !mode.enabled && !add.enabled && !Button(controller, @"setup-remove-drive").enabled, @"Drive save carries preferences and freezes all controls");
+    [controller updateSave:nil error:@"Retry the save"];
+    Require([controller.draft isEqual:saved] && mode.enabled, @"A failed drive save preserves the selection for retry");
+    configuration[@"config"] = saved;
+    [controller updateConfiguration:configuration error:nil];
+    Require([controller.draft isEqual:saved], @"Reload restores manual mode and saved drive choices");
+    [TestDefaults setObject:@"ko" forKey:@"interfaceLanguage"]; [controller reloadLocalization];
+    Require([mode.selectedItem.title isEqual:@"직접 선택"] && [Button(controller, @"setup-remove-drive").title containsString:@"제거"], @"Drive controls are localized in Korean");
+    [TestDefaults setObject:@"en" forKey:@"interfaceLanguage"]; [controller reloadLocalization];
+    Choose((NSPopUpButton *)Find(controller.window.contentView, @"setup-scope"), @"configured");
+    Require(mode.hiddenOrHasHiddenAncestor, @"Explicit folder selection keeps its own drive roots");
+    [controller close];
+}
 static void CheckLayout(NSView *view, NSView *container) {
     if (view.hidden) return;
     if ([view isKindOfClass:NSScrollView.class]) {
@@ -74,6 +189,8 @@ int main(int argc, const char **argv) {
         NSString *output = argc > 1 ? [NSString stringWithUTF8String:argv[1]] : nil;
         int passed = 0, failures = 0;
         @try {
+            CheckDegradedDriveInventory(); passed++;
+            CheckDriveManagement(output); passed++;
             Class controllerClass = NSClassFromString(@"JasoSetupWindowController");
             Require(controllerClass != Nil, @"The native folder setup controller is not implemented");
             JasoSetupWindowController *controller = [[controllerClass alloc] init];
@@ -219,7 +336,7 @@ int main(int argc, const char **argv) {
             [controller updateSave:@{@"config":requestedDraft, @"revision":@"fixture-revision", @"started":@YES, @"paused":@NO} error:nil];
             [controller updateConfiguration:Configuration(@"configured", NO) error:nil];
             [roots selectAll:nil]; [Button(controller, @"setup-remove-folder") performClick:nil];
-            Require([controller.draft[@"roots"] count] == 0 && !Button(controller, @"setup-preview").enabled && !Button(controller, @"setup-save").enabled, @"An empty selected-folder scope needs a folder before preview or save");
+            Require([controller.draft[@"roots"] count] == 0 && !Button(controller, @"setup-preview").enabled && Button(controller, @"setup-save").enabled, @"An empty selected-folder scope can be saved as idle without previewing");
             passed++;
 
             [controller updateConfiguration:Configuration(@"configured", YES) error:nil];

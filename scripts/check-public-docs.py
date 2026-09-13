@@ -204,7 +204,7 @@ def main() -> int:
                     error(path, line, message)
         return documents[path]
 
-    paths = sorted(SITE.rglob("*.html"))
+    paths = sorted(SITE.rglob("*.html")) + sorted((ROOT / "docs").rglob("*.md"))
     for required in (SITE / "index.html", SITE / "en/index.html", *(ROOT / name for name in PUBLIC_MARKDOWN)):
         if not required.is_file():
             error(required, 1, "required public entry page is missing")

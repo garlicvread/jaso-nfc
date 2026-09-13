@@ -1,5 +1,6 @@
 #import "../macos/SettingsWindow.h"
 #import "../macos/Localization.h"
+#import "../macos/ContentZoom.h"
 #import <objc/runtime.h>
 
 static NSUserDefaults *TestDefaults;
@@ -27,6 +28,7 @@ static void Choose(NSPopUpButton *picker, NSString *value) {
     Require(NO, @"The requested language is absent from Settings");
 }
 static void CheckLayout(NSView *view, NSView *content) {
+    if (view.hidden) return;
     if ([view isKindOfClass:NSScrollView.class]) {
         NSView *document = [(NSScrollView *)view documentView];
         Require(document.frame.size.width <= [(NSScrollView *)view contentView].bounds.size.width + 1, @"Settings document must fit its viewport");
@@ -117,9 +119,15 @@ int main(int argc, const char **argv) {
             Require(appearanceChanges == 2 && [TestDefaults integerForKey:@"markStyle"] == 0, @"Icon theme must persist and notify the menu immediately");
             passed++;
 
+            NSButton *advanced = (id)Find(controller.window.contentView, @"settings-advanced-toggle");
+            Require(advanced && [advanced.title isEqual:@"Advanced settings"] && ![advanced.accessibilityValue boolValue], @"Settings must expose a clearly named, collapsed Advanced settings section");
+            NSButton *userGuide = (id)Find(controller.window.contentView, @"user-guide");
+            Require(userGuide && !userGuide.hiddenOrHasHiddenAncestor, @"User guide must be accessible independently of advanced settings");
+            [advanced performClick:nil];
+            Require(!Find(controller.window.contentView, @"full-disk-access-guide").hiddenOrHasHiddenAncestor, @"Expanding Advanced settings reveals permission controls");
             NSMutableArray *actions = [NSMutableArray array];
             controller.actionHandler = ^(NSString *action) { [actions addObject:action]; };
-            NSArray *actionIDs = @[@"login-items", @"full-disk-access", @"reveal-app"];
+            NSArray *actionIDs = @[@"login-items", @"full-disk-access", @"reveal-app", @"user-guide"];
             for (NSString *identifier in actionIDs) {
                 NSButton *button = (NSButton *)Find(controller.window.contentView, identifier);
                 Require([button isKindOfClass:NSButton.class] && button.enabled, @"A required permissions action is missing from Settings");
@@ -127,7 +135,7 @@ int main(int argc, const char **argv) {
             }
             Require([actions isEqual:actionIDs], @"Permissions buttons did not dispatch their intended callbacks");
             NSString *guide = [(NSTextField *)Find(controller.window.contentView, @"full-disk-access-guide") stringValue];
-            Require(![guide containsString:@"~/Applications/"] && [guide containsString:@"Finder"] && [guide containsString:@"+"] && [guide containsString:@"/Applications/Jaso NFC.app"] && [guide containsString:@"Restart worker"], @"Full Disk Access guidance must explain adding the installed app and restarting the worker");
+            Require(![guide containsString:@"~/Applications/"] && [guide containsString:@"Finder"] && [guide containsString:@"+"] && [guide containsString:@"/Applications/Jaso NFC.app"] && [guide containsString:@"Restart cleanup"], @"Full Disk Access guidance must explain adding the installed app and restarting cleanup");
             passed++;
 
             __block int changes = 0;
@@ -138,6 +146,7 @@ int main(int argc, const char **argv) {
             Require(changes == 1 && [JasoLanguagePreference() isEqual:@"ko"] && JasoUsesKorean(), @"Korean selection did not save and invoke the callback");
             Require([[TestDefaults stringForKey:@"interfaceLanguage"] isEqual:@"ko"], @"Language selection was not persisted to defaults");
             Require([callbackTitle isEqual:@"Jaso NFC · 설정"], @"The callback ran before the Settings window was relocalized");
+            Require([advanced.title isEqual:@"상세 설정"] && [userGuide.title isEqual:@"사용 설명서 열기…"], @"Advanced settings and User guide must have distinct Korean labels");
             Require([[picker itemAtIndex:0].title isEqual:@"시스템 설정"], @"The system language choice was not relocalized");
             Require([[(NSTextField *)Find(controller.window.contentView, @"interface-language-label") stringValue] isEqual:@"언어"], @"The language label was not relocalized");
             Require([[(NSButton *)Find(controller.window.contentView, @"login-items") title] isEqual:@"로그인 항목 열기…"], @"Permissions actions did not relocalize");
@@ -166,10 +175,13 @@ int main(int argc, const char **argv) {
                 Choose(picker, language);
                 for (NSString *appearance in @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]) {
                     controller.window.appearance = [NSAppearance appearanceNamed:appearance];
-                    [controller.window.contentView layoutSubtreeIfNeeded];
-                    CheckLayout(controller.window.contentView, controller.window.contentView);
-                    if (output) Render(controller, [output stringByAppendingPathComponent:[NSString stringWithFormat:@"settings-%@-%@.png", language, [appearance isEqual:NSAppearanceNameAqua] ? @"light" : @"dark"]]);
-                    passed++;
+                    for (NSNumber *zoom in @[@1, @2]) {
+                        JasoSetContentZoom(zoom.doubleValue);
+                        [controller.window.contentView layoutSubtreeIfNeeded];
+                        CheckLayout(controller.window.contentView, controller.window.contentView);
+                        if (output) Render(controller, [output stringByAppendingPathComponent:[NSString stringWithFormat:@"settings-%@-%@-%@.png", language, [appearance isEqual:NSAppearanceNameAqua] ? @"light" : @"dark", zoom]]);
+                        passed++;
+                    }
                 }
             }
 

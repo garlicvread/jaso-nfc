@@ -18,6 +18,8 @@ jobs:
           python-version: '3.11'
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
+      - name: Check release metadata consistency
+        run: python3 native/tests/test_release_metadata.py
       - name: Check Rust diagnostics
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test native modules and integration

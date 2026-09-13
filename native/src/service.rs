@@ -23,6 +23,30 @@ pub fn make_normalizer(config: &Config) -> Result<Normalizer> {
     )
 }
 
+fn history_activity_result<T>(activity: &crate::activity::Activity, result: &Result<T>) {
+    match result {
+        Ok(_) => {
+            activity.finish("updating_history", None);
+            activity.resolve("updating_history", None, "checked");
+        }
+        Err(error) => activity.failed_with_reason(
+            "updating_history",
+            None,
+            Some(&format!("{error:#}")),
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+        ),
+    }
+}
+
+fn maintain_history(config: &Config, activity: &crate::activity::Activity) -> Result<Value> {
+    activity.begin("updating_history", None);
+    let result = crate::history::maintain(config);
+    history_activity_result(activity, &result);
+    result
+}
+
 pub fn watch(config: &Config) -> Result<()> {
     watch_with_menu(config, None, false)
 }
@@ -93,9 +117,15 @@ fn start_menu(_: &Config, _: &Path) -> Result<()> {
 
 fn watch_with_menu(config: &Config, config_path: Option<&Path>, open_menu: bool) -> Result<()> {
     let _lock = RuntimeLock::acquire(config, Duration::ZERO)?;
+    let activity = crate::activity::Activity::new();
+    let _responder = crate::activity_transport::ActivityResponder::start(config, activity.clone())?;
+    let _activity_binding = activity.bind();
     let wake = Arc::new(Wakeup::new(config.state_path("wake.fifo"))?);
     let signals = StopSignals::install(&wake)?;
     let index = Arc::new(Index::new(config.state_path("index.sqlite3"), false)?);
+    if let Err(error) = maintain_history(config, &activity) {
+        diagnostic(config, &format!("history maintenance: {error:#}"));
+    }
     let mut normalizer = make_normalizer(config)?;
     let notify = wake.clone();
     let mut sources = SourceWorker::new(
@@ -112,6 +142,10 @@ fn watch_with_menu(config: &Config, config_path: Option<&Path>, open_menu: bool)
     }
     let result = (|| -> Result<()> {
         let mut recovery_checked = false;
+        let mut history_counted = 0;
+        let mut history_checked = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .unwrap();
         diagnostic(
             config,
             &format!(
@@ -125,7 +159,14 @@ fn watch_with_menu(config: &Config, config_path: Option<&Path>, open_menu: bool)
                 break;
             }
             sources.check()?;
+            // Explicit history requests use this same mutation worker and lock,
+            // including while automatic normalization remains paused.
+            if let Some(policy) = index.current_policy()? {
+                normalizer.policy = policy;
+                crate::history::process_requests(config, &mut normalizer)?;
+            }
             if crate::control::paused(config)? {
+                activity.set_state("paused", "paused");
                 // Continue recording filesystem events while mutations are paused.
                 // A due work queue must not turn a paused worker into a busy loop.
                 wake.wait(None)?;
@@ -136,9 +177,27 @@ fn watch_with_menu(config: &Config, config_path: Option<&Path>, open_menu: bool)
                 normalizer.recover()?;
                 recovery_checked = true;
             }
+            // Capacity failures pause new work with backoff. Existing pending
+            // recovery above and explicit restore handling remain serialized.
+            if let Err(error) = crate::storage::ensure_write_capacity(config) {
+                activity.set_issue("low_storage", &error.to_string());
+                wake.wait(Some(Duration::from_secs(30)))?;
+                continue;
+            }
+            activity.clear_issue("low_storage");
             let retry_checked_at = now();
             match index.work(&mut normalizer) {
-                Ok(true) => continue,
+                Ok(true) => {
+                    if activity.renamed_count() != history_counted
+                        && history_checked.elapsed() >= Duration::from_secs(30)
+                    {
+                        if maintain_history(config, &activity).is_ok() {
+                            history_counted = activity.renamed_count();
+                        }
+                        history_checked = std::time::Instant::now();
+                    }
+                    continue;
+                }
                 Ok(false) => {}
                 Err(error) => {
                     if error
@@ -160,6 +219,17 @@ fn watch_with_menu(config: &Config, config_path: Option<&Path>, open_menu: bool)
                     return Err(error);
                 }
             }
+            if activity.renamed_count() != history_counted {
+                if maintain_history(config, &activity).is_ok() {
+                    history_counted = activity.renamed_count();
+                }
+                history_checked = std::time::Instant::now();
+            }
+            if index.current_policy()?.is_some() {
+                activity.set_state("idle", "waiting_for_events");
+            } else {
+                activity.set_state("waiting_metadata", "discovering_sources");
+            }
             wake.wait(timeout(
                 [
                     index.next_wakeup()?,
@@ -171,6 +241,7 @@ fn watch_with_menu(config: &Config, config_path: Option<&Path>, open_menu: bool)
         }
         Ok(())
     })();
+    activity.set_state("stopping", "stopping");
     let closed = sources.close(); // Drain callbacks before releasing the database.
     let message = match (&result, &closed) {
         (Err(error), _) => format!("native watch failed: {error:#}"),
@@ -198,15 +269,14 @@ fn read_json(path: &Path) -> Result<Value> {
 
 // Interpret only the layout written by journal::candidate_signature. A saved
 // immutable flag is evidence of a lock at the last failure, not a fresh stat.
-fn saved_retry_locked(signature: Option<&Value>) -> bool {
-    let Some(parts) = signature.and_then(Value::as_array).filter(|v| v.len() == 3) else {
-        return false;
-    };
+fn saved_retry_metadata(signature: Option<&Value>) -> Option<(Option<u32>, bool)> {
+    let parts = signature
+        .and_then(Value::as_array)
+        .filter(|v| v.len() == 3)?;
     let mut locked = false;
+    let mut source_mode = None;
     for (n, part) in parts.iter().enumerate() {
-        let Some(values) = part.as_array() else {
-            return false;
-        };
+        let values = part.as_array()?;
         if values.len() == 2
             && values[0] == "unavailable"
             && (values[1].is_null() || values[1].as_i64().is_some())
@@ -220,12 +290,19 @@ fn saved_retry_locked(signature: Option<&Value>) -> bool {
                 .any(|v| !v.as_u64().is_some_and(|v| v <= u32::MAX as u64))
             || (n != 2 && values[6].as_i64().is_none())
         {
-            return false;
+            return None;
+        }
+        if n == 0 {
+            source_mode = Some(values[2].as_u64().unwrap() as u32);
         }
         // macOS sys/stat.h: UF_IMMUTABLE and SF_IMMUTABLE.
         locked |= values[5].as_u64().unwrap() & (0x0000_0002 | 0x0002_0000) != 0;
     }
-    locked
+    Some((source_mode, locked))
+}
+
+fn saved_retry_locked(signature: Option<&Value>) -> bool {
+    saved_retry_metadata(signature).is_some_and(|(_, locked)| locked)
 }
 
 fn rename_retry_items(entries: &serde_json::Map<String, Value>) -> Vec<Value> {
@@ -293,20 +370,76 @@ pub fn runtime_status(config: &Config) -> Result<Value> {
     } else {
         json!({"indexed":false})
     };
+    let activity = crate::activity_transport::snapshot_for(config)?;
     let status = value
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("invalid index status"))?;
     status.extend(json!({
-        "version":env!("CARGO_PKG_VERSION"),"engine":"rust","running":crate::control::running(config)?,"paused":crate::control::paused(config)?,
+        "version":env!("CARGO_PKG_VERSION"),"schema_version":2,"activity":activity.get("activity").cloned().unwrap_or(Value::Null),"engine":"rust","running":crate::control::running(config)?,"paused":crate::control::paused(config)?,
         "apply":config.apply,"scope":config.scope,
         "roots":coverage.get("roots").cloned().unwrap_or(json!(config.roots)),
         "active_roots":coverage.get("active_roots").cloned().unwrap_or(json!([])),
         "unavailable_roots":coverage.get("unavailable").cloned().unwrap_or(json!({})),
         "catalog_unavailable":coverage.get("catalog_unavailable").cloned().unwrap_or(json!({})),
+        "disconnected_roots":coverage.get("disconnected_roots").cloned().unwrap_or(json!([])),
+        "manual_waiting_roots":coverage.get("manual_waiting_roots").cloned().unwrap_or(json!([])),
+        "today_renamed":crate::history::cached_today_count(config)?,
         "deferred_renames":entries.len(),
         "rename_retry_items":rename_retry_items(entries),
         "next_rename_retry":entries.values().filter_map(|r|r.get("next_retry").and_then(Value::as_f64)).reduce(f64::min),
         "pending_recovery":config.state_path("pending.json").exists()
+    }).as_object().unwrap().clone());
+    let disconnected = coverage.get("disconnected_roots").and_then(Value::as_array);
+    let desired_roots = coverage.get("roots").and_then(Value::as_array);
+    let retry_coverage = crate::coverage::Coverage {
+        roots: desired_roots
+            .map(|roots| {
+                roots
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_else(|| config.roots.clone()),
+        root_excludes: coverage
+            .get("root_excludes")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    let retry_policy = crate::sources::policy_for(config, &retry_coverage, None);
+    let current_entries: serde_json::Map<String, Value> = entries
+        .iter()
+        .filter(|(path, record)| {
+            let directory = saved_retry_metadata(record.get("signature"))
+                .and_then(|(mode, _)| mode)
+                .is_some_and(|mode| mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32);
+            let accepted = if directory {
+                retry_policy.accepts_directory_lexically(path)
+            } else {
+                retry_policy.accepts_lexically(path)
+            };
+            accepted
+                && !disconnected.is_some_and(|roots| {
+                    roots
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|root| crate::policy::within(path, root))
+                })
+        })
+        .map(|(path, record)| (path.clone(), record.clone()))
+        .collect();
+    let current = status
+        .entry("current")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("invalid current index status"))?;
+    current.extend(json!({
+        "deferred_renames":current_entries.len(),
+        "rename_retry_items":rename_retry_items(&current_entries),
+        "next_rename_retry":current_entries.values().filter_map(|r|r.get("next_retry").and_then(Value::as_f64)).reduce(f64::min)
     }).as_object().unwrap().clone());
     Ok(value)
 }
@@ -337,11 +470,168 @@ pub fn diagnostic(config: &Config, message: &str) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn history_activity_keeps_cause_and_success_resolves_without_outcome_counters() {
+        let activity = crate::activity::Activity::new();
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES))
+            .context("updating history");
+        history_activity_result(&activity, &Err::<(), _>(error));
+        let failed = activity.snapshot();
+        assert_eq!(failed["events"][0]["errno"], libc::EACCES);
+        assert!(
+            failed["events"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("updating history")
+        );
+        history_activity_result(&activity, &Ok(()));
+        let recovered = activity.snapshot();
+        assert_eq!(recovered["events"][0]["resolution"], "checked");
+        for counter in ["processed", "renamed", "errors", "deferred"] {
+            assert_eq!(recovered["counters"][counter], failed["counters"][counter]);
+        }
+        assert_eq!(recovered["events"].as_array().unwrap().len(), 1);
+    }
+
     fn retry_record(next_retry: f64) -> Value {
         json!({
             "signature": [[1, 2, 33188, 501, 20, 0, 100], ["unavailable", 2], [1, 3, 16877, 501, 20, 32770]],
             "reason": "1", "count": 3, "last_failure": 100.0, "next_retry": next_retry
         })
+    }
+
+    #[test]
+    fn disconnected_rename_retries_are_dormant_while_recovery_remains_actionable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            state_dir: temp.path().to_string_lossy().into_owned(),
+            roots: vec![
+                "/Volumes/Media".into(),
+                "/Users/me".into(),
+                "/Volumes/Media2".into(),
+            ],
+            ..Config::default()
+        };
+        std::fs::create_dir_all(config.state_path("state").parent().unwrap())?;
+        let entries = json!({"/Volumes/Media/file": retry_record(10.0), "/Users/me/file": retry_record(20.0), "/Volumes/Media2/file": retry_record(30.0)});
+        let skip = serde_json::to_vec(&json!({"entries": entries}))?;
+        std::fs::write(config.state_path("skip.json"), &skip)?;
+        std::fs::write(
+            config.state_path("coverage.json"),
+            serde_json::to_vec(&json!({"disconnected_roots":["/Volumes/Media"]}))?,
+        )?;
+        std::fs::write(config.state_path("pending.json"), b"recovery evidence")?;
+        std::fs::write(config.state_path("journal.jsonl"), b"history")?;
+        let value = runtime_status(&config)?;
+        assert_eq!(value["deferred_renames"], 3);
+        assert_eq!(value["current"]["deferred_renames"], 2);
+        assert_eq!(value["current"]["next_rename_retry"], 20.0);
+        assert_eq!(
+            value["current"]["rename_retry_items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(value["disconnected_roots"], json!(["/Volumes/Media"]));
+        assert_eq!(value["pending_recovery"], true);
+        std::fs::write(
+            config.state_path("coverage.json"),
+            serde_json::to_vec(&json!({"roots":["/Users/me"], "disconnected_roots":[]}))?,
+        )?;
+        let removed = runtime_status(&config)?;
+        assert_eq!(removed["deferred_renames"], 3);
+        assert_eq!(removed["current"]["deferred_renames"], 1);
+        assert_eq!(removed["current"]["next_rename_retry"], 20.0);
+        assert_eq!(removed["pending_recovery"], true);
+        std::fs::write(
+            config.state_path("coverage.json"),
+            serde_json::to_vec(
+                &json!({"roots":["/Volumes/Media", "/Users/me", "/Volumes/Media2"], "disconnected_roots":["/Volumes/Media"]}),
+            )?,
+        )?;
+        let replaced = runtime_status(&config)?;
+        assert_eq!(replaced["current"]["deferred_renames"], 2);
+        assert_eq!(replaced["deferred_renames"], 3);
+        assert_eq!(std::fs::read(config.state_path("skip.json"))?, skip);
+        assert_eq!(
+            std::fs::read(config.state_path("pending.json"))?,
+            b"recovery evidence"
+        );
+        assert_eq!(
+            std::fs::read(config.state_path("journal.jsonl"))?,
+            b"history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_rename_retries_follow_hidden_scope_and_saved_coverage_without_writes() -> Result<()>
+    {
+        for scope in ["configured", "all-user-files"] {
+            let temp = tempfile::tempdir()?;
+            let config = Config {
+                scope: scope.into(),
+                roots: if scope == "configured" {
+                    vec!["/Users/me/Projects".into()]
+                } else {
+                    vec![]
+                },
+                excludes: vec!["/Users/me/Projects/Excluded".into()],
+                exclude_names: vec!["ignored".into()],
+                skip_hidden_tops: vec![],
+                state_dir: temp.path().to_string_lossy().into_owned(),
+                ..Config::default()
+            };
+            let mut directory = retry_record(2.0);
+            directory["signature"][0][2] = json!(libc::S_IFDIR | 0o755);
+            let entries = json!({
+                "/Users/me/Projects/file": retry_record(100.0),
+                "/Users/me/Projects/.dotfile": retry_record(110.0),
+                "/Users/me/Projects/.hidden-directory": directory,
+                "/Users/me/Projects/.cache/file": retry_record(1.0),
+                "/Users/me/Projects/.explicit/file": retry_record(120.0),
+                "/Users/me/Projects/.explicit/.cache/file": retry_record(3.0),
+                "/Users/me/Projects/Excluded/file": retry_record(4.0),
+                "/Users/me/Projects/ignored/file": retry_record(5.0),
+                "/Volumes/Media/file": retry_record(130.0),
+                "/Volumes/Media/Cache/file": retry_record(6.0),
+                "/Volumes/Offline/file": retry_record(7.0)
+            });
+            let skip = serde_json::to_vec(&json!({"version": 1, "entries": entries}))?;
+            let coverage = serde_json::to_vec(&json!({
+                "roots": ["/Users/me/Projects", "/Users/me/Projects/.explicit", "/Volumes/Media", "/Volumes/Offline"],
+                "active_roots": [],
+                "disconnected_roots": ["/Volumes/Offline"],
+                "root_excludes": {"/Volumes/Media": ["/Volumes/Media/Cache"]}
+            }))?;
+            std::fs::create_dir_all(config.state_path("skip.json").parent().unwrap())?;
+            std::fs::write(config.state_path("skip.json"), &skip)?;
+            std::fs::write(config.state_path("coverage.json"), &coverage)?;
+            let value = runtime_status(&config)?;
+            assert_eq!(value["deferred_renames"], 11);
+            assert_eq!(value["current"]["deferred_renames"], 4);
+            assert_eq!(value["current"]["next_rename_retry"], 100.0);
+            let paths: Vec<_> = value["current"]["rename_retry_items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["path"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                paths,
+                [
+                    "/Users/me/Projects/file",
+                    "/Users/me/Projects/.dotfile",
+                    "/Users/me/Projects/.explicit/file",
+                    "/Volumes/Media/file"
+                ]
+            );
+            assert_eq!(std::fs::read(config.state_path("skip.json"))?, skip);
+            assert_eq!(std::fs::read(config.state_path("coverage.json"))?, coverage);
+            assert!(!config.state_path("index.sqlite3").exists());
+        }
+        Ok(())
     }
 
     #[test]

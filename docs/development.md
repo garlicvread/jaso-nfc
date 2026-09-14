@@ -13,6 +13,7 @@ cargo test --locked
 cargo build --locked
 python3 native/tests/test_cli.py
 python3 native/tests/test_app_trampoline.py
+python3 native/tests/test_release_signing.py
 sh scripts/build-native.sh
 ```
 
@@ -31,6 +32,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 CI runs native checks and app-bundle construction, including the menu startup harness, on `macos-latest`. Separate Python compatibility jobs use Python 3.11 and 3.14. A successful CI bundle build establishes neither notarization nor permission to access protected user folders.
+
+Both build scripts default to local mode: an ad hoc signature, a `-local` DMG name, and no Apple credentials. The explicit `--release` mode signs with a Developer ID Application identity and notarizes and staples the payload app and the DMG; its inputs `JASO_SIGNING_IDENTITY`, `JASO_TEAM_ID`, and `JASO_NOTARY_PROFILE`, the signing sequence, and the acceptance checklist are in [Release signing and notarization](releasing.md). `python3 native/tests/test_release_signing.py` exercises the release preflight and sequencing with stubbed signing and notary tools; it needs no certificate or notary profile, and passing it is not evidence that a real artifact was signed or accepted. Pull request and CI builds never receive signing credentials.
 
 ## Filesystem fixtures
 

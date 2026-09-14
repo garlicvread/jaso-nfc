@@ -81,6 +81,8 @@ sh scripts/build-installer.sh --app 'dist/Jaso NFC.app'
 
 The output is `dist/Jaso-NFC-<version>-<architecture>-local.dmg` for the build machine's architecture. Packaging checks the payload, metadata, installation instructions, MIT license, and accompanying `.dmg.sha256` checksum. The release includes that checksum for download-integrity checks. See [build validation](development.md) for the test workflow.
 
+The local package is ad hoc signed and not notarized. The current 0.2.1 download is a `-local` package of this kind, so macOS asks for confirmation on the first launch, as described in [macOS blocks the installer](#macos-blocks-the-installer). Company release packages are built with `sh scripts/build-installer.sh --release` on a company-controlled Mac and are named without `-local`; the process is in [Release signing and notarization](releasing.md).
+
 ## Native development build
 
 Use macOS 13 or later, stable Rust, the Xcode Command Line Tools, and Python 3.11 or later. Python runs the bundle-validation suites in the build script.

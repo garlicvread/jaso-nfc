@@ -100,8 +100,9 @@ def verify_code(path, executable=False):
                    'certificate 1[field.1.2.840.113635.100.6.2.6] exists and '
                    'certificate leaf[field.1.2.840.113635.100.6.1.13] exists and '
                    f'certificate leaf[subject.OU] = "{team}"')
+    # codesign treats a requirement without a leading '=' as a filename.
     run(["codesign", "--verify", "--strict", "--all-architectures",
-         "--test-requirement", requirement, path])
+         "--test-requirement", f"={requirement}", path])
     architectures = run(["lipo", "-archs", path]).split() if executable else [None]
     if not architectures:
         raise ReleaseError(f"No executable architectures: {path}")

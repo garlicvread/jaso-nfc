@@ -1,10 +1,12 @@
-"""Isolated release control-flow tests. No real signing, credentials, or notary service.
+"""Credential-free release tests. No company signing, credentials, or notary service.
 
 Task-owned PATH tools emulate external operations, including deliberately invalid
 success responses. The shell integration fixture emulates compilation and DMGs;
 test_installer_package.py separately checks a real built disk image on macOS.
+The macOS requirement regression uses real codesign on an owned ad hoc fixture.
 """
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,15 +15,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 PROJECT = Path(__file__).resolve().parents[2]
 TEAM = "ABCDE12345"
 IDENTITY = f"Developer ID Application: Fixture Company ({TEAM})"
 
-# Every external signing/notary command is shadowed, even in missing-input tests.
+# ReleaseSigning shadows every signing/notary command, even in missing-input tests.
 # No fixture switch is implemented in production scripts.
 TOOL = r'''
-import hashlib, json, os, pathlib, plistlib, shutil, sys, zipfile
+import hashlib, json, os, pathlib, plistlib, shutil, signal, subprocess, sys, zipfile
 tools = pathlib.Path(__file__).resolve().parent
 state = json.loads((tools / "state.json").read_text())
 command, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
@@ -124,6 +127,22 @@ elif command == "hdiutil":
 elif command == "shasum":
     path = pathlib.Path(args[-1])
     print(hashlib.sha256(path.read_bytes()).hexdigest() + "  " + path.name)
+elif command in ("mv", "ln"):
+    source, target = map(pathlib.Path, args[-2:])
+    publishing = command == "mv" and target.parent.name == "dist"
+    restoring = command == "ln" and target.parent.name == "dist"
+    if publishing and target.suffix == ".dmg" and state.get("fail_final_move"):
+        sys.exit(73)
+    if command == "ln" and target.parent.name.startswith(".installer-publish."):
+        if target.suffix == ".sha256" and state.get("fail_backup"):
+            sys.exit(74)
+    if restoring and target.suffix == ".sha256" and state.get("fail_restore"):
+        sys.exit(75)
+    # Exercise real filesystem renames/links, failing only the selected operation.
+    status = subprocess.call(["/bin/" + command, *args])
+    if status == 0 and publishing and target.suffix == ".sha256" and state.get("publish_signal"):
+        os.kill(os.getppid(), getattr(signal, "SIG" + state["publish_signal"]))
+    sys.exit(status)
 else:
     raise AssertionError(command)
 '''
@@ -154,6 +173,32 @@ else:
 '''
 
 
+@unittest.skipUnless(sys.platform == "darwin", "Requires the real macOS codesign parser")
+class RealRequirementParser(unittest.TestCase):
+    def test_helper_requirement_parses_and_rejects_adhoc_by_policy(self):
+        spec = importlib.util.spec_from_file_location("release_signing", PROJECT / "scripts/release_signing.py")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        with tempfile.TemporaryDirectory(prefix="jaso-requirement-test-") as directory:
+            binary = Path(directory) / "adhoc-fixture"
+            shutil.copyfile("/bin/echo", binary)
+            binary.chmod(0o755)
+            env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                   "JASO_SIGNING_IDENTITY": IDENTITY, "JASO_TEAM_ID": TEAM}
+            for arguments in (("--force", "--sign", "-", "--timestamp=none"),
+                              ("--verify", "--strict", "--all-architectures")):
+                result = subprocess.run(["/usr/bin/codesign", *arguments, str(binary)],
+                                        env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # Call the production helper, without substituting its expression or
+            # mocking codesign: a syntax/path error must not satisfy this test.
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(helper.ReleaseError) as failure:
+                    helper.verify_code(binary, executable=True)
+            self.assertIn("code failed to satisfy specified code requirement(s)", str(failure.exception))
+            self.assertNotIn("invalid requirement specification", str(failure.exception))
+
+
 class ReleaseSigning(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="jaso-release-test-")
@@ -168,7 +213,7 @@ class ReleaseSigning(unittest.TestCase):
         tool.write_text(f"#!{sys.executable}\n" + TOOL)
         tool.chmod(0o755)
         for name in ("uname", "security", "codesign", "lipo", "xcrun", "spctl", "ditto",
-                     "clang", "cargo", "iconutil", "hdiutil", "shasum"):
+                     "clang", "cargo", "iconutil", "hdiutil", "shasum", "mv", "ln"):
             (self.tools / name).symlink_to(tool)
         (self.tools / "python3").symlink_to(sys.executable)
         for name in ("scripts/build-native.sh", "scripts/build-installer.sh", "scripts/release_signing.py",
@@ -220,6 +265,28 @@ class ReleaseSigning(unittest.TestCase):
     def app_contents(self):
         return {str(path.relative_to(self.app)): (path.stat().st_mode, path.read_bytes())
                 for path in self.app.rglob("*") if path.is_file()}
+
+    def output_pair(self):
+        image = self.project / "dist/Jaso-NFC-0.2.1-arm64.dmg"
+        return image, image.with_suffix(".dmg.sha256")
+
+    def previous_pair(self):
+        image, checksum = self.output_pair()
+        image.parent.mkdir(exist_ok=True)
+        image.write_bytes(b"PREVIOUS DMG")
+        checksum.write_text(hashlib.sha256(image.read_bytes()).hexdigest() + "  " + image.name + "\n")
+        return {path.name: path.read_bytes() for path in (image, checksum)}
+
+    def assert_published_pair(self, previous=None):
+        image, checksum = self.output_pair()
+        self.assertEqual(checksum.read_text().split(),
+                         [hashlib.sha256(image.read_bytes()).hexdigest(), image.name])
+        if previous is not None:
+            self.assertEqual({path.name: path.read_bytes() for path in (image, checksum)}, previous)
+
+    def assert_publication_cleaned(self):
+        self.assertFalse(list((self.project / "build").glob("installer.*")))
+        self.assertFalse(list((self.project / "dist").glob(".installer-publish.*")))
 
     def test_missing_release_inputs_fail_before_build_or_credentials(self):
         for script, missing in (("build-native.sh", "JASO_SIGNING_IDENTITY"),
@@ -393,6 +460,120 @@ class ReleaseSigning(unittest.TestCase):
         result = self.installer("--release")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, previous)
+
+    def test_second_final_move_failure_restores_pair_or_leaves_neither_file(self):
+        for has_previous in (False, True):
+            with self.subTest(has_previous=has_previous):
+                previous = self.previous_pair() if has_previous else None
+                self.configure(fail_final_move=True)
+                result = self.installer("--release")
+                self.assertEqual(result.returncode, 73, result.stdout + result.stderr)
+                if previous is not None:
+                    self.assert_published_pair(previous)
+                else:
+                    self.assert_failed_without_artifact(result)
+                self.assert_publication_cleaned()
+
+    def test_handled_signals_after_first_final_move_roll_back(self):
+        for signal_name in ("HUP", "INT", "TERM"):
+            for has_previous in (False, True):
+                with self.subTest(signal=signal_name, has_previous=has_previous):
+                    for path in self.output_pair():
+                        path.unlink(missing_ok=True)
+                    previous = self.previous_pair() if has_previous else None
+                    self.configure(publish_signal=signal_name)
+                    result = self.installer("--release")
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    if previous is not None:
+                        self.assert_published_pair(previous)
+                    else:
+                        self.assert_failed_without_artifact(result)
+                    self.assert_publication_cleaned()
+
+    def test_backup_failure_preserves_prior_pair_without_final_moves(self):
+        previous = self.previous_pair()
+        self.configure(fail_backup=True)
+        result = self.installer("--release")
+        self.assertEqual(result.returncode, 74, result.stdout + result.stderr)
+        self.assert_published_pair(previous)
+        self.assertFalse(any(event[0] == "mv" for event in self.events()))
+        self.assert_publication_cleaned()
+
+    def test_rollback_failure_keeps_complete_recovery_pair_outside_staging(self):
+        previous = self.previous_pair()
+        self.configure(fail_final_move=True, fail_restore=True)
+        result = self.installer("--release")
+        self.assert_failed_without_artifact(result)
+        backups = list((self.project / "dist").glob(".installer-publish.*"))
+        self.assertEqual(len(backups), 1)
+        backup = backups[0]
+        self.assertIn("Publication rollback failed; recovery files retained at: " + str(backup.resolve()), result.stderr)
+        self.assertEqual({path.name: path.read_bytes() for path in backup.iterdir()}, previous)
+        self.assertFalse(list((self.project / "build").glob("installer.*")))
+        # Both backups survive even though the first restore succeeded. They
+        # are sufficient to recover the exact prior pair after the I/O fault.
+        for path in backup.iterdir():
+            os.link(path, backup.parent / path.name)
+        self.assert_published_pair(previous)
+
+    def test_publication_replaces_complete_prior_pair(self):
+        previous = self.previous_pair()
+        result = self.installer("--release")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_published_pair()
+        self.assertNotEqual(self.output_pair()[0].read_bytes(), previous[self.output_pair()[0].name])
+        self.assert_publication_cleaned()
+
+    def test_publication_rejects_symlink_and_directory_final_paths(self):
+        external = self.root / "do-not-change"
+        external.write_bytes(b"OWNED EXTERNAL FIXTURE")
+        for index in (0, 1):
+            for kind in ("symlink", "dangling", "directory"):
+                with self.subTest(index=index, kind=kind):
+                    previous = self.previous_pair()
+                    path = self.output_pair()[index]
+                    path.unlink()
+                    if kind == "directory":
+                        path.mkdir()
+                    else:
+                        path.symlink_to(external if kind == "symlink" else self.root / "absent")
+                    result = self.installer("--release")
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("Publication requires a regular file or absent path", result.stderr)
+                    other = self.output_pair()[1 - index]
+                    self.assertEqual(other.read_bytes(), previous[other.name])
+                    self.assertEqual(external.read_bytes(), b"OWNED EXTERNAL FIXTURE")
+                    if kind == "directory":
+                        self.assertEqual(list(path.iterdir()), [])
+                        path.rmdir()
+                    else:
+                        self.assertTrue(path.is_symlink())
+                        path.unlink()
+                    self.assert_publication_cleaned()
+
+    def test_publication_rejects_symlink_dist(self):
+        external = self.root / "owned-external-dist"
+        external.mkdir()
+        (self.project / "dist").symlink_to(external, target_is_directory=True)
+        result = self.installer("--release")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Publication dist must not be a symlink", result.stderr)
+        self.assertEqual(list(external.iterdir()), [])
+        self.assertTrue((self.project / "dist").is_symlink())
+        self.assert_publication_cleaned()
+
+    def test_publication_preserves_and_rejects_incomplete_prior_pair(self):
+        for index in (0, 1):
+            with self.subTest(missing=index):
+                previous = self.previous_pair()
+                self.output_pair()[index].unlink()
+                result = self.installer("--release")
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("incomplete outputs were preserved", result.stderr)
+                other = self.output_pair()[1 - index]
+                self.assertEqual(other.read_bytes(), previous[other.name])
+                self.assertFalse(self.output_pair()[index].exists())
+                self.assert_publication_cleaned()
 
     def test_native_release_signs_without_a_notary_profile(self):
         del self.env["JASO_NOTARY_PROFILE"]

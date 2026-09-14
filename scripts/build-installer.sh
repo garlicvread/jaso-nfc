@@ -27,7 +27,40 @@ if [ -z "$app_dir" ]; then
 fi
 mkdir -p "$project_dir/build" "$project_dir/dist"
 stage_dir=$(mktemp -d "$project_dir/build/installer.XXXXXX")
-trap 'rm -rf "$stage_dir"' EXIT
+publish_backup=
+publish_active=0
+previous_pair=0
+rollback_publication() {
+    # Backups remain intact until BOTH old names have been restored. Hard links
+    # keep restoration on the dist filesystem and never copy partial file bytes.
+    rm -f "$final_dmg" "$final_checksum" || return 1
+    if [ "$previous_pair" = 1 ]; then
+        if ln "$publish_backup/$dmg_name" "$final_dmg" &&
+           ln "$publish_backup/$dmg_name.sha256" "$final_checksum"; then
+            return 0
+        fi
+        rm -f "$final_dmg" "$final_checksum"
+        return 1
+    fi
+    return 0
+}
+cleanup() {
+    result=$?
+    trap - EXIT
+    # A second handled signal must not interrupt rollback or discard its backup.
+    trap '' HUP INT TERM
+    if [ "$publish_active" = 1 ] && ! rollback_publication; then
+        printf 'Publication rollback failed; recovery files retained at: %s\n' "$publish_backup" >&2
+        publish_backup=
+        result=1
+    fi
+    if [ -n "$publish_backup" ]; then
+        rm -rf "$publish_backup" || printf 'Publication backup retained at: %s\n' "$publish_backup" >&2
+    fi
+    rm -rf "$stage_dir"
+    exit "$result"
+}
+trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 if [ "$release" = 1 ]; then
     # Never sign or staple a caller's --app. Finish the payload before embedding it.
@@ -134,6 +167,29 @@ fi
 )
 JASO_INSTALLER_DMG="$dmg_path" JASO_INSTALLER_PAYLOAD="$app_dir" JASO_RELEASE_MODE="$release" python3 native/tests/test_installer_package.py
 # Publishable names are only populated after every packaging/release check passes.
-mv "$dmg_path.sha256" "$project_dir/dist/$dmg_name.sha256"
-mv "$dmg_path" "$project_dir/dist/$dmg_name"
-printf '%s\n' "$project_dir/dist/$dmg_name"
+final_dmg="$project_dir/dist/$dmg_name"
+final_checksum="$final_dmg.sha256"
+test ! -L "$project_dir/dist" || { echo 'Publication dist must not be a symlink.' >&2; exit 1; }
+for final in "$final_dmg" "$final_checksum"; do
+    if [ -L "$final" ] || { [ -e "$final" ] && [ ! -f "$final" ]; }; then
+        printf 'Publication requires a regular file or absent path: %s\n' "$final" >&2
+        exit 1
+    fi
+done
+if [ -f "$final_dmg" ] && [ -f "$final_checksum" ]; then
+    previous_pair=1
+elif [ -e "$final_dmg" ] || [ -e "$final_checksum" ]; then
+    echo 'Publication requires both prior files or neither; incomplete outputs were preserved.' >&2
+    exit 1
+fi
+publish_backup=$(mktemp -d "$project_dir/dist/.installer-publish.XXXXXX")
+if [ "$previous_pair" = 1 ]; then
+    ln "$final_dmg" "$publish_backup/$dmg_name"
+    ln "$final_checksum" "$publish_backup/$dmg_name.sha256"
+fi
+# Arm rollback BEFORE any final-name mutation, including the first move.
+publish_active=1
+mv -f "$dmg_path.sha256" "$final_checksum"
+mv -f "$dmg_path" "$final_dmg"
+publish_active=0
+printf '%s\n' "$final_dmg"

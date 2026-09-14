@@ -1479,6 +1479,77 @@ fn canonical_error_scope_retries_failed_child_and_ignores_unenumerated_entries()
 }
 
 #[test]
+fn retry_discovery_coalesced_into_a_recursive_job_keeps_its_generation() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.baseline(vec![])?;
+    f.index.request_reconcile(None)?;
+    f.scan.results.insert(
+        f.root.clone(),
+        ScanResult {
+            scope: f.root.clone(),
+            scan_id: Some("recursive-retry".into()),
+            complete: false,
+            ..Default::default()
+        },
+    );
+    let before: i64 = f.index.lock()?.db.query_row(
+        "SELECT generation FROM jobs WHERE path=?",
+        [&f.root],
+        |row| row.get(0),
+    )?;
+    for _ in 0..3 {
+        f.scan.retries = vec![format!("{}/child", f.root)];
+        assert!(f.index.work(&mut f.scan)?);
+    }
+    let generation: i64 = f.index.lock()?.db.query_row(
+        "SELECT generation FROM jobs WHERE path=?",
+        [&f.root],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        generation, before,
+        "an ancestor already owns recursive coverage"
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_retry_discovery_does_not_extend_an_existing_job_generation() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.baseline(vec![])?;
+    f.scan.results.insert(
+        f.root.clone(),
+        ScanResult {
+            scope: f.root.clone(),
+            scan_id: Some("retry-snapshot".into()),
+            complete: false,
+            ..Default::default()
+        },
+    );
+    for _ in 0..3 {
+        f.scan.retries = vec![f.root.clone()];
+        assert!(f.index.work(&mut f.scan)?);
+    }
+    let generation: i64 = f.index.lock()?.db.query_row(
+        "SELECT generation FROM jobs WHERE path=?",
+        [&f.root],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        generation, 1,
+        "one unresolved retry must own one durable job ticket"
+    );
+    f.observed(&f.root.clone(), vec![]);
+    assert!(f.index.work(&mut f.scan)?);
+    assert_eq!(f.index.status()?["pending_jobs"], 0);
+    // A later failure under the same parent must receive another ticket.
+    f.scan.retries = vec![f.root.clone()];
+    assert!(f.index.work(&mut f.scan)?);
+    assert_eq!(f.index.status()?["pending_jobs"], 0);
+    Ok(())
+}
+
+#[test]
 fn mutation_failure_retries_only_enumerated_parent_and_preserves_delay() -> Result<()> {
     let mut f = Fixture::new()?;
     let file = format!("{}/file", f.root);

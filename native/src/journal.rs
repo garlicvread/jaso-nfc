@@ -98,7 +98,7 @@ impl JournalLocks {
         Ok(Self { _files: files })
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RetryRecord {
     pub signature: Vec<Value>,
     pub reason: String,
@@ -111,11 +111,112 @@ struct RetryFile {
     version: u32,
     entries: BTreeMap<String, RetryRecord>,
 }
+/// Mutable retry records with a revision that cannot be bypassed through a map
+/// reference. Revisions also distinguish a replacement map from the old map.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub struct RetryEntries {
+    values: BTreeMap<String, RetryRecord>,
+    #[serde(skip)]
+    revision: u64,
+}
+impl RetryEntries {
+    fn new(values: BTreeMap<String, RetryRecord>) -> Self {
+        let mut entries = Self {
+            values,
+            revision: 0,
+        };
+        entries.changed();
+        entries
+    }
+    fn changed(&mut self) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.revision = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn insert(&mut self, path: String, record: RetryRecord) -> Option<RetryRecord> {
+        if self.values.get(&path) != Some(&record) {
+            self.changed();
+        }
+        self.values.insert(path, record)
+    }
+    pub fn remove(&mut self, path: &str) -> Option<RetryRecord> {
+        let removed = self.values.remove(path);
+        if removed.is_some() {
+            self.changed();
+        }
+        removed
+    }
+    pub fn retain(&mut self, mut keep: impl FnMut(&String, &RetryRecord) -> bool) {
+        let count = self.values.len();
+        let revision = self.revision;
+        // A panicking predicate may already have removed preceding records.
+        self.changed();
+        self.values.retain(|path, record| keep(path, record));
+        if self.values.len() == count {
+            self.revision = revision;
+        }
+    }
+    pub fn get_mut(&mut self, path: &str) -> Option<RetryEntryEdit<'_>> {
+        let before = self.values.get(path)?.clone();
+        let revision = self.revision;
+        // Invalidate before exposing mutable access; even a forgotten guard
+        // cannot leave a changed record hidden behind an old revision.
+        self.changed();
+        Some(RetryEntryEdit {
+            entries: self,
+            path: path.into(),
+            before,
+            revision,
+        })
+    }
+}
+impl std::ops::Deref for RetryEntries {
+    type Target = BTreeMap<String, RetryRecord>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+impl<'a> IntoIterator for &'a RetryEntries {
+    type Item = (&'a String, &'a RetryRecord);
+    type IntoIter = std::collections::btree_map::Iter<'a, String, RetryRecord>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+/// An edit invalidates persistence/scheduling only when the record changed.
+pub struct RetryEntryEdit<'a> {
+    entries: &'a mut RetryEntries,
+    path: String,
+    before: RetryRecord,
+    revision: u64,
+}
+impl std::ops::Deref for RetryEntryEdit<'_> {
+    type Target = RetryRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.entries.values[&self.path]
+    }
+}
+impl std::ops::DerefMut for RetryEntryEdit<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.entries.values.get_mut(&self.path).unwrap()
+    }
+}
+impl Drop for RetryEntryEdit<'_> {
+    fn drop(&mut self) {
+        if self.entries.values[&self.path] == self.before {
+            self.entries.revision = self.revision;
+        }
+    }
+}
 pub struct RetryState {
     pub path: Option<PathBuf>,
-    pub entries: BTreeMap<String, RetryRecord>,
+    pub entries: RetryEntries,
     base: f64,
     maximum: f64,
+    saved: std::cell::RefCell<Option<(PathBuf, u64)>>,
 }
 pub fn path_signature(path: &Path, parent: bool) -> Vec<Value> {
     match fs::symlink_metadata(path) {
@@ -165,7 +266,7 @@ impl RetryState {
         if !base.is_finite() || !maximum.is_finite() || base <= 0. || maximum < base {
             bail!("retry intervals must satisfy 0 < base <= maximum");
         }
-        let entries = if let Some(path) = path.as_ref().filter(|p| p.exists()) {
+        let (entries, loaded) = if let Some(path) = path.as_ref().filter(|p| p.exists()) {
             let data: RetryFile = serde_json::from_reader(File::open(path)?)?;
             if data.version != 1 {
                 bail!("unsupported retry state; preserve it before resetting");
@@ -175,23 +276,27 @@ impl RetryState {
                     bail!("invalid retry state record");
                 }
             }
-            data.entries
+            (data.entries, true)
         } else {
-            BTreeMap::new()
+            (BTreeMap::new(), false)
         };
+        let entries = RetryEntries::new(entries);
+        let saved = loaded.then(|| (path.as_ref().unwrap().clone(), entries.revision()));
         Ok(Self {
             path,
             entries,
             base,
             maximum,
+            saved: std::cell::RefCell::new(saved),
         })
     }
     pub fn deferred(&mut self, src: &str, dst: &str) -> bool {
         let signature = candidate_signature(src, dst);
-        let Some(record) = self.entries.get_mut(src) else {
+        let Some(mut record) = self.entries.get_mut(src) else {
             return false;
         };
         if record.signature != signature {
+            drop(record);
             self.entries.remove(src);
             return false;
         }
@@ -221,7 +326,18 @@ impl RetryState {
     }
     pub fn save(&self) -> Result<()> {
         if let Some(path) = &self.path {
+            if self
+                .saved
+                .borrow()
+                .as_ref()
+                .is_some_and(|(saved_path, revision)| {
+                    saved_path == path && *revision == self.entries.revision()
+                })
+            {
+                return Ok(());
+            }
             atomic_json(path, &json!({"version":1,"entries":self.entries}))?;
+            *self.saved.borrow_mut() = Some((path.clone(), self.entries.revision()));
         }
         Ok(())
     }
@@ -930,6 +1046,78 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "visitor-stop");
     }
+    #[test]
+    fn unchanged_retry_save_keeps_the_persisted_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("retry.json");
+        let retry = RetryState::new(Some(path.clone()), 1., 60.).unwrap();
+        retry.save().unwrap();
+        let before = fs::metadata(&path).unwrap();
+        retry.save().unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(
+            before.ino(),
+            after.ino(),
+            "unchanged save replaced retry state"
+        );
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        let reopened = RetryState::new(Some(path.clone()), 1., 60.).unwrap();
+        reopened.save().unwrap();
+        assert_eq!(after.ino(), fs::metadata(&path).unwrap().ino());
+    }
+
+    #[test]
+    fn unchanged_retry_edits_do_not_rewrite_but_forgotten_edits_are_saved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("retry.json");
+        let mut retry = RetryState::new(Some(path.clone()), 1., 60.).unwrap();
+        retry.failure("/missing/a", "/missing/b", "busy");
+        retry.save().unwrap();
+        let before = fs::metadata(&path).unwrap().ino();
+        let original = retry.entries["/missing/a"].clone();
+        retry.entries.insert("/missing/a".into(), original.clone());
+        retry.entries.retain(|_, _| true);
+        retry.entries.get_mut("/missing/a").unwrap().next_retry = original.next_retry;
+        retry.save().unwrap();
+        assert_eq!(before, fs::metadata(&path).unwrap().ino());
+        let mut edit = retry.entries.get_mut("/missing/a").unwrap();
+        edit.next_retry = 3.;
+        std::mem::forget(edit);
+        retry.save().unwrap();
+        assert_eq!(
+            RetryState::new(Some(path), 1., 60.).unwrap().entries["/missing/a"].next_retry,
+            3.
+        );
+    }
+
+    #[test]
+    fn retry_edits_and_failed_saves_remain_durable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("retry.json");
+        let mut retry = RetryState::new(Some(path.clone()), 1., 60.).unwrap();
+        retry.failure("/missing/a", "/missing/b", "busy");
+        retry.save().unwrap();
+        retry.entries.get_mut("/missing/a").unwrap().next_retry = 7.;
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(retry.save().is_err());
+        fs::remove_dir(&path).unwrap();
+        retry.save().unwrap();
+        let reopened = RetryState::new(Some(path.clone()), 1., 60.).unwrap();
+        assert_eq!(reopened.entries["/missing/a"].next_retry, 7.);
+        let before = fs::metadata(&path).unwrap().ino();
+        retry.save().unwrap();
+        assert_eq!(before, fs::metadata(&path).unwrap().ino());
+        retry.entries.remove("/missing/a");
+        retry.save().unwrap();
+        assert!(
+            RetryState::new(Some(path), 1., 60.)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
     #[test]
     fn retry_roundtrip_retains_unresolved_records_and_rejects_invalid_state() {
         let temp = tempfile::tempdir().unwrap();

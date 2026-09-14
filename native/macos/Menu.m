@@ -259,6 +259,10 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
 @property BOOL busy;
 @property JasoWorkspaceWindowController *statusWindow;
 @property dispatch_queue_t activityQueue;
+@property NSMutableArray<JasoWorkspaceReply> *activityReplies;
+@property NSDictionary *activityResult;
+@property NSString *activityResultConfig;
+@property NSTimeInterval activityResultTime;
 @property dispatch_queue_t historyQueue;
 @property NSMutableSet<NSTask *> *queryTasks;
 @property dispatch_group_t queryGroup;
@@ -279,6 +283,7 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     if ((self = [super init])) {
         _workerQueue = dispatch_queue_create("io.github.garlicvread.jaso-nfc.ui-commands", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
         _activityQueue = dispatch_queue_create("io.github.garlicvread.jaso-nfc.activity", DISPATCH_QUEUE_SERIAL);
+        _activityReplies = NSMutableArray.new;
         _queryTasks=NSMutableSet.new;_queryGroup=dispatch_group_create();
         _historyQueue = dispatch_queue_create("io.github.garlicvread.jaso-nfc.history", DISPATCH_QUEUE_SERIAL);
     }
@@ -564,6 +569,7 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
 }
 - (void)requestWorkspace:(NSString *)request parameters:(NSDictionary *)parameters reply:(JasoWorkspaceReply)reply {
     if (self.quitting) { reply(nil, L(@"Jaso NFC is closing.", @"Jaso NFC를 종료하고 있습니다.")); return; }
+    if ([request isEqual:@"activity"]) { [self requestActivityFresh:[parameters[@"fresh"] boolValue] reply:reply]; return; }
     NSMutableArray *arguments=NSMutableArray.new;
     if ([@[@"activity",@"storage"] containsObject:request]) [arguments addObject:request];
     else if ([request isEqual:@"history"]) {
@@ -577,6 +583,39 @@ static NSMenuItem *JasoMenuCommand(NSString *title, SEL action, NSString *key, i
     [arguments addObjectsFromArray:@[@"--config",self.configPath]];
     dispatch_async([request isEqual:@"activity"]?self.activityQueue:self.historyQueue, ^{
         @autoreleasepool { NSString *error=nil; NSDictionary *result=[self execute:arguments error:&error]; reply(result,error); }
+    });
+}
+- (void)requestActivityFresh:(BOOL)fresh reply:(JasoWorkspaceReply)reply {
+    NSDictionary *cached=nil; NSString *rejected=nil; BOOL launch=NO;
+    @synchronized(self) {
+        // One parsed result serves both Activity windows. The short cache only
+        // joins nearby polls; explicit refresh always bypasses it. Errors retry.
+        if(self.quitting)rejected=L(@"Jaso NFC is closing.",@"Jaso NFC를 종료하고 있습니다.");
+        else if(!fresh && self.activityResult && [self.activityResultConfig isEqual:self.configPath] && NSProcessInfo.processInfo.systemUptime-self.activityResultTime<.75)cached=self.activityResult;
+        else if(self.activityReplies.count>=8)rejected=L(@"Activity is already being refreshed. Try again in a moment.",@"활동을 새로고침하고 있습니다. 잠시 후 다시 시도하세요.");
+        else { [self.activityReplies addObject:[reply copy]];launch=self.activityReplies.count==1; }
+    }
+    if(cached||rejected){reply(cached,rejected);return;}
+    if(!launch)return;
+    NSString *config=[self.configPath copy];
+    dispatch_async(self.activityQueue, ^{
+        @autoreleasepool {
+            NSString *error=nil;NSDictionary *result=[self execute:@[@"activity",@"--config",config] error:&error];
+            dispatch_async(dispatch_get_main_queue(),^{
+                NSArray<JasoWorkspaceReply> *replies;
+                @synchronized(self) {
+                    // Keep the flight pending until it publishes. Otherwise a
+                    // cache hit could expose B before queued publication A.
+                    self.activityResult=!error&&!self.quitting?result:nil;
+                    self.activityResultConfig=config;self.activityResultTime=NSProcessInfo.processInfo.systemUptime;
+                    replies=self.activityReplies.copy;[self.activityReplies removeAllObjects];
+                }
+                // Publish immediately to both views, including a detached view
+                // whose own timer just reused the previous cached response.
+                if(!self.quitting)[self.statusWindow updateActivity:result error:error];
+                for(JasoWorkspaceReply consumer in replies)consumer(result,error);
+            });
+        }
     });
 }
 - (void)copyDiagnostics:(id)sender {

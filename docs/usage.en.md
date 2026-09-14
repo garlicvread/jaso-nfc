@@ -2,11 +2,11 @@
 
 [한국어](usage.md) · English · [Download](../README.en.md)
 
-Start with Korean filenames in Downloads, then add the folders you need. This guide covers Jaso NFC 0.2.0: folder selection, filename preview, automatic cleanup, and restoring an original name.
+Start with Korean filenames in Downloads, then add the folders you need. This guide covers Jaso NFC 0.2.1: folder selection, filename preview, automatic cleanup, and restoring an original name.
 
 ## Install and open
 
-1. On an Apple Silicon Mac (M1 or later) running macOS 13 or later, [download the installer](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.0/Jaso-NFC-0.2.0-arm64-local.dmg).
+1. On an Apple Silicon Mac (M1 or later) running macOS 13 or later, [download the installer](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.1/Jaso-NFC-0.2.1-arm64-local.dmg).
 2. Open the DMG, double-click `Install Jaso NFC.app`, and choose `Install`.
 3. Choose `Keep Installer` or `Move Installer to Trash` when it finishes. The Trash action applies to the original DMG. If the button is disabled, manage that file in Finder.
 4. Close the installer and eject its mounted disk in Finder.

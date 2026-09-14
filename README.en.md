@@ -8,9 +8,9 @@ Repair decomposed or garbled Korean filenames. Jaso NFC automatically cleans up 
 
 ## Download
 
-[Download](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.0/Jaso-NFC-0.2.0-arm64-local.dmg)
+[Download](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.1/Jaso-NFC-0.2.1-arm64-local.dmg)
 
-0.2.0 · Apple Silicon Mac (M1 or later) · macOS 13 or later · Free / [MIT licensed](LICENSE)
+0.2.1 · Apple Silicon Mac (M1 or later) · macOS 13 or later · Free / [MIT licensed](LICENSE)
 
 ## Which names can change?
 
@@ -60,6 +60,8 @@ Use `Activity` to review recent work and items currently waiting. When a task st
 
 Each completed rename creates one change record. Checking the same file again updates progress, and retries for the same issue update its existing activity entry. Recent history stays within a storage budget, with older records retired automatically. See the space used by the file index, history, logs, and saved app versions in `Settings` → `Advanced settings` → `Storage usage…`.
 
+Open Activity in a separate window to see the same current progress in both windows. Turn off `Follow new activity` when reading an earlier entry. Progress updates preserve your selected entry and reading position.
+
 Close the window to leave cleanup running in the background. Choose `Quit Jaso NFC` from the menu to stop the work too. Open the app from Applications when you want to use it again.
 
 ## When you need help
@@ -74,7 +76,7 @@ Close the window to leave cleanup running in the background. Choose `Quit Jaso N
 
 Open these instructions from `Settings` → `Open user guide…` in the app.
 
-[Complete user guide](docs/usage.en.md) · [Installation and upgrades](docs/installation.md) · [Release notes](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.2.0)
+[Complete user guide](docs/usage.en.md) · [Installation and upgrades](docs/installation.md) · [Release notes](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.2.1)
 
 Contact us through [GitHub issues](https://github.com/garlicvread/jaso-nfc/issues) or [aidall_manager@aidall.tech](mailto:aidall_manager@aidall.tech). Include the app version and status message. Before sharing information copied from `Settings` → `Advanced settings`, remove private filenames and paths.
 

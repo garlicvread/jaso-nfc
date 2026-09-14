@@ -8,9 +8,9 @@
 
 ## 다운로드
 
-[다운로드](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.0/Jaso-NFC-0.2.0-arm64-local.dmg)
+[다운로드](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.1/Jaso-NFC-0.2.1-arm64-local.dmg)
 
-0.2.0 · Apple Silicon Mac(M1 이후) · macOS 13 이상 · 무료 / [MIT 라이선스](LICENSE)
+0.2.1 · Apple Silicon Mac(M1 이후) · macOS 13 이상 · 무료 / [MIT 라이선스](LICENSE)
 
 ## 어떤 이름이 바뀌나요?
 
@@ -60,6 +60,8 @@
 
 정리한 이름은 변경 이력을 한 번 남깁니다. 같은 파일을 다시 검사할 때는 진행 정보만 갱신하고, 같은 문제로 재시도할 때는 활동 목록의 기존 항목을 갱신합니다. 최근 변경 기록은 정해진 용량 안에서 보관하고 오래된 기록부터 자동으로 정리합니다. `설정` → `상세 설정` → `저장 공간 사용량…`에서 파일 목록, 변경 기록, 로그와 앱 버전이 차지하는 공간을 확인하세요.
 
+활동을 별도 창으로 열면 두 창에서 같은 최신 진행 상황을 확인할 수 있습니다. 이전 항목을 읽을 때는 `새 활동 따라가기`를 끄세요. 선택한 항목과 읽던 위치를 유지하면서 진행 정보를 갱신합니다.
+
 창을 닫으면 백그라운드에서 정리를 계속합니다. 작업까지 종료하려면 메뉴에서 `Jaso NFC 종료`를 선택하세요. 다음에 사용할 때는 응용 프로그램 폴더에서 앱을 여세요.
 
 ## 도움이 필요할 때
@@ -74,7 +76,7 @@
 
 앱의 `설정` → `사용 설명서 열기…`에서도 안내를 확인하세요.
 
-[전체 사용 설명서](docs/usage.md) · [설치 및 업그레이드](docs/installation.md) · [릴리스 정보](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.2.0)
+[전체 사용 설명서](docs/usage.md) · [설치 및 업그레이드](docs/installation.md) · [릴리스 정보](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.2.1)
 
 문의는 [GitHub 이슈](https://github.com/garlicvread/jaso-nfc/issues) 또는 [aidall_manager@aidall.tech](mailto:aidall_manager@aidall.tech)로 보내 주세요. 앱 버전과 상태 메시지를 함께 알려 주세요. `설정` → `상세 설정`에서 복사한 진단 정보를 공유하기 전에는 개인 파일명과 경로를 지워 주세요.
 

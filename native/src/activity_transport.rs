@@ -98,9 +98,12 @@ fn envelope(activity: &Activity) -> Vec<u8> {
 }
 pub struct ActivityResponder {
     stop: Arc<AtomicBool>,
+    wake: UnixStream,
     thread: Option<JoinHandle<()>>,
     path: PathBuf,
     identity: (u64, u64),
+    #[cfg(test)]
+    accept_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl ActivityResponder {
     /// Caller holds RuntimeLock for this Config until this responder is dropped.
@@ -136,6 +139,7 @@ impl ActivityResponder {
             }
             fs::remove_file(&path)?;
         }
+        let (wake, shutdown) = UnixStream::pair()?;
         let listener = UnixListener::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
@@ -143,11 +147,43 @@ impl ActivityResponder {
         let identity = (info.dev(), info.ino());
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        #[cfg(test)]
+        let accept_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(test)]
+        let thread_attempts = accept_attempts.clone();
         let thread = std::thread::Builder::new()
             .name("activity".into())
             .spawn(move || {
                 // Exactly one client at a time; no client threads or unbounded queue.
                 while !stopped.load(Ordering::Acquire) {
+                    let mut ready = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: shutdown.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // A private socket pair also wakes an idle listener on drop.
+                    // Neither request delivery nor shutdown needs a polling timer.
+                    if unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as _, -1) } < 0 {
+                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        break;
+                    }
+                    if stopped.load(Ordering::Acquire) || ready[1].revents != 0 {
+                        break;
+                    }
+                    if ready[0].revents & libc::POLLIN == 0 {
+                        break;
+                    }
+                    #[cfg(test)]
+                    thread_attempts.fetch_add(1, Ordering::Relaxed);
                     match listener.accept() {
                         Ok((mut client, _)) => {
                             let result = (|| -> io::Result<()> {
@@ -159,9 +195,11 @@ impl ActivityResponder {
                             })();
                             let _ = result;
                         }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            std::thread::park_timeout(Duration::from_millis(10))
-                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) => {}
                         Err(_) => break,
                     }
                 }
@@ -169,9 +207,12 @@ impl ActivityResponder {
         match thread {
             Ok(thread) => Ok(Self {
                 stop,
+                wake,
                 thread: Some(thread),
                 path,
                 identity,
+                #[cfg(test)]
+                accept_attempts,
             }),
             Err(error) => {
                 let _ = fs::remove_file(path);
@@ -183,8 +224,8 @@ impl ActivityResponder {
 impl Drop for ActivityResponder {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let _ = self.wake.shutdown(std::net::Shutdown::Both);
         if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
             let _ = thread.join();
         }
         if fs::symlink_metadata(&self.path)
@@ -386,6 +427,32 @@ mod tests {
         sync::mpsc,
         time::{Duration, Instant},
     };
+    #[test]
+    fn idle_responder_waits_for_requests_and_stops_promptly() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            state_dir: directory.path().to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let responder = ActivityResponder::start(&config, Activity::new())?;
+        assert_eq!(snapshot_for(&config)?["available"], true);
+        let before = responder.accept_attempts.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(100));
+        let idle_attempts = responder.accept_attempts.load(Ordering::Relaxed) - before;
+        assert!(idle_attempts <= 1, "idle accept attempts: {idle_attempts}");
+        for _ in 0..20 {
+            assert_eq!(snapshot_for(&config)?["available"], true);
+        }
+        let path = socket_path(&config);
+        let (finished, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(responder);
+            finished.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(2))?;
+        assert!(!path.exists());
+        Ok(())
+    }
     #[test]
     fn refuses_to_replace_non_socket_or_live_endpoint() -> Result<()> {
         let directory = tempfile::tempdir()?;

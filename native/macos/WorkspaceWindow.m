@@ -9,18 +9,40 @@ static NSString *S(id value) { return [value isKindOfClass:NSString.class] ? val
 static NSDictionary *D(id value) { return [value isKindOfClass:NSDictionary.class] ? value : @{}; }
 static NSArray *A(id value) { return [value isKindOfClass:NSArray.class] ? value : @[]; }
 static NSNumber *N(id value) { return [value isKindOfClass:NSNumber.class] ? value : nil; }
+// CLI JSON is already immutable. Retain those objects, but detach any mutable
+// containers supplied by another caller so in-place edits cannot bypass diffing.
+static id ImmutableActivity(id value) {
+    if([value isKindOfClass:NSDictionary.class]) {
+        NSMutableDictionary *copy=[value isKindOfClass:NSMutableDictionary.class]?[value mutableCopy]:nil;
+        for(id key in value){id child=value[key],frozen=ImmutableActivity(child);if(child!=frozen){if(!copy)copy=[value mutableCopy];copy[key]=frozen;}}
+        return copy?copy.copy:value;
+    }
+    if([value isKindOfClass:NSArray.class]) {
+        NSMutableArray *copy=[value isKindOfClass:NSMutableArray.class]?[value mutableCopy]:nil;
+        for(NSUInteger i=0;i<[value count];i++){id child=value[i],frozen=ImmutableActivity(child);if(child!=frozen){if(!copy)copy=[value mutableCopy];copy[i]=frozen;}}
+        return copy?copy.copy:value;
+    }
+    return [value isKindOfClass:NSMutableString.class]?[value copy]:value;
+}
 static NSString *Count(id value) { return N(value) ? [NSNumberFormatter localizedStringFromNumber:value numberStyle:NSNumberFormatterDecimalStyle] : @"—"; }
+// These formatters are used only by main-thread presentation. Locale/time-zone
+// notifications reset them together with the rendered presentation caches.
+static NSISO8601DateFormatter *TimeISO;
+static NSDateFormatter *TimeLocal, *TimeDisplay;
 static NSString *Time(id value) {
     if (S(value).length) {
-        NSISO8601DateFormatter *iso=NSISO8601DateFormatter.new;
-        NSDate *date=[iso dateFromString:S(value)];
-        if(!date) { NSDateFormatter *local=NSDateFormatter.new;local.locale=[NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];local.dateFormat=@"yyyy-MM-dd HH:mm:ss";date=[local dateFromString:[S(value) stringByReplacingOccurrencesOfString:@"T" withString:@" "]]; }
+        if(!TimeISO)TimeISO=NSISO8601DateFormatter.new;
+        NSDate *date=[TimeISO dateFromString:S(value)];
+        if(!date) {
+            if(!TimeLocal){TimeLocal=NSDateFormatter.new;TimeLocal.locale=[NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];TimeLocal.dateFormat=@"yyyy-MM-dd HH:mm:ss";}
+            date=[TimeLocal dateFromString:[S(value) stringByReplacingOccurrencesOfString:@"T" withString:@" "]];
+        }
         if(!date)return S(value);
         value=@(date.timeIntervalSince1970);
     }
     if (!N(value)) return @"—";
-    NSDateFormatter *format=NSDateFormatter.new; format.dateStyle=NSDateFormatterShortStyle; format.timeStyle=NSDateFormatterMediumStyle;
-    return [format stringFromDate:[NSDate dateWithTimeIntervalSince1970:[value doubleValue]]];
+    if(!TimeDisplay){TimeDisplay=NSDateFormatter.new;TimeDisplay.dateStyle=NSDateFormatterShortStyle;TimeDisplay.timeStyle=NSDateFormatterMediumStyle;}
+    return [TimeDisplay stringFromDate:[NSDate dateWithTimeIntervalSince1970:[value doubleValue]]];
 }
 NSDictionary *JasoWorkspaceStatus(NSDictionary *snapshot, NSString *error, BOOL korean) {
     NSMutableDictionary *result=[JasoStatusPresentation(snapshot,error,korean) mutableCopy];
@@ -152,6 +174,11 @@ static NSView *Card(NSView *view) {
 @property NSProgressIndicator *activityProgress;
 @property NSTableView *activityTable;
 @property NSArray *activityRows;
+@property NSString *activityRowsSession;
+@property NSDictionary *activitySemantic;
+@property NSArray *activityIssuePresentation;
+@property NSDictionary *statusStructure;
+@property NSTextField *statusCount;
 @property NSTimer *timer;
 @property NSUInteger tick;
 @property BOOL busy;
@@ -185,6 +212,8 @@ static NSView *Card(NSView *view) {
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(visibilityChanged:) name:NSApplicationDidHideNotification object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(visibilityChanged:) name:NSApplicationDidUnhideNotification object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(zoomChanged:) name:JasoContentZoomDidChangeNotification object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(formattingChanged:) name:NSSystemTimeZoneDidChangeNotification object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(formattingChanged:) name:NSCurrentLocaleDidChangeNotification object:nil];
     [self rebuildNavigation]; [self render]; return self;
 }
 - (NSButton *)button:(NSString *)title action:(SEL)action identifier:(NSString *)identifier {
@@ -224,7 +253,8 @@ static NSView *Card(NSView *view) {
 - (void)render {
     for(NSView *view in self.pageHost.subviews.copy)[view removeFromSuperview];
     self.adaptiveRows=NSMutableArray.new;
-    self.activityTable=nil;self.heroTitle=nil;self.heroDescription=nil;self.activityLocation=nil;self.scroll=nil;
+    self.activityTable=nil;self.activityRows=nil;self.activityRowsSession=nil;self.activitySemantic=nil;self.activityIssuePresentation=nil;self.activityIssues=nil;
+    self.heroTitle=nil;self.heroDescription=nil;self.activityLocation=nil;self.scroll=nil;self.statusStructure=nil;self.statusCount=nil;
     NSView *embedded=self.embedded[self.selectedSection];
     if(embedded){embedded.translatesAutoresizingMaskIntoConstraints=NO;[self.pageHost addSubview:embedded];Pin(embedded,self.pageHost,0);return;}
     self.scroll=NSScrollView.new;self.scroll.contentView=WorkspaceClip.new;self.scroll.translatesAutoresizingMaskIntoConstraints=NO;self.scroll.hasVerticalScroller=YES;self.scroll.autohidesScrollers=YES;self.scroll.drawsBackground=NO;
@@ -265,6 +295,26 @@ static NSView *Card(NSView *view) {
         row.alignment=vertical?NSLayoutAttributeLeading:NSLayoutAttributeCenterY;
     }
 }
+- (NSString *)statusCountText {
+    return [NSString stringWithFormat:W(@"Renamed today: %@",@"오늘 이름을 정리한 파일: %@"),Count(self.history[@"today_count"]?:self.snapshot[@"today_renamed"])];
+}
+- (NSDictionary *)structureForStatus:(NSDictionary *)presentation {
+    NSMutableArray *issues=NSMutableArray.new;
+    for(NSDictionary *issue in A(presentation[@"issues"]))if([N(issue[@"requiresAction"]) boolValue]&&issues.count<3)[issues addObject:issue];
+    NSArray *records=A(self.history[@"items"]);
+    NSString *location=[N(self.activity[@"available"]) boolValue]?S(D(self.activity[@"activity"])[@"scope_path"]):@"";
+    return @{@"action":S(presentation[@"primaryAction"]),@"issues":issues,@"records":[records subarrayWithRange:NSMakeRange(0,MIN(3,records.count))],@"location":location,@"retry":S(presentation[@"automaticRetrySummary"])};
+}
+- (void)refreshStatusFields {
+    NSDictionary *presentation=JasoWorkspaceStatus(self.snapshot,self.snapshotError,JasoUsesKorean());
+    if(![self.statusStructure isEqual:[self structureForStatus:presentation]]) {
+        if(self.scroll)self.scrollPositions[@"status"]=[NSValue valueWithPoint:self.scroll.contentView.bounds.origin];
+        [self render];return;
+    }
+    if(![self.heroTitle.stringValue isEqual:presentation[@"title"]])self.heroTitle.stringValue=presentation[@"title"];
+    if(![self.heroDescription.stringValue isEqual:presentation[@"subtitle"]])self.heroDescription.stringValue=presentation[@"subtitle"];
+    NSString *count=[self statusCountText];if(![self.statusCount.stringValue isEqual:count])self.statusCount.stringValue=count;
+}
 - (void)renderStatus {
     NSDictionary *presentation=JasoWorkspaceStatus(self.snapshot,self.snapshotError,JasoUsesKorean());
     Add(self.body,Label(W(@"Status",@"상태"),12,NSFontWeightMedium));
@@ -279,7 +329,7 @@ static NSView *Card(NSView *view) {
         NSStackView *location=Stack(@[Label(W(@"Current folder",@"현재 확인하는 폴더"),12,NSFontWeightMedium),Label([S(live[@"scope_path"]) lastPathComponent],18,NSFontWeightSemibold),Label(S(live[@"scope_path"]),12,NSFontWeightRegular)],YES,8);Add(self.body,Card(location));
     }
     NSStackView *stats=Stack(@[],YES,10);
-    Add(stats,Label([NSString stringWithFormat:W(@"Renamed today: %@",@"오늘 이름을 정리한 파일: %@"),Count(self.history[@"today_count"]?:self.snapshot[@"today_renamed"])],19,NSFontWeightMedium));
+    self.statusCount=Label([self statusCountText],19,NSFontWeightMedium);Add(stats,self.statusCount);
     [stats addArrangedSubview:[self button:W(@"View history",@"변경 기록 보기") action:@selector(showHistory:) identifier:@"status-history"]];
     Add(self.body,Card(stats));
     NSMutableArray *actionIssues=NSMutableArray.new;
@@ -297,6 +347,7 @@ static NSView *Card(NSView *view) {
     }
     if(S(presentation[@"automaticRetrySummary"]).length){NSTextField *note=Label(presentation[@"automaticRetrySummary"],11,NSFontWeightRegular);note.textColor=NSColor.secondaryLabelColor;Add(self.body,note);}
     [self.body addArrangedSubview:[self button:W(@"Manage folders",@"폴더 관리") action:@selector(showFolders:) identifier:@"status-folders"]];
+    self.statusStructure=[self structureForStatus:presentation];
 }
 - (NSString *)phaseDescription:(NSString *)phase {
     return S(JasoActivityPresentation(@{@"phase":phase?:@""},JasoUsesKorean())[@"title"]);
@@ -321,20 +372,31 @@ static NSView *Card(NSView *view) {
     NSScrollView *feed=NSScrollView.new;feed.translatesAutoresizingMaskIntoConstraints=NO;feed.hasVerticalScroller=YES;feed.documentView=self.activityTable;[feed.heightAnchor constraintEqualToConstant:280].active=YES;Add(self.body,feed);
     self.activityIssues=Stack(@[],YES,10);Add(self.body,self.activityIssues);
     self.activityRetention=Label(@"",11,NSFontWeightRegular);self.activityRetention.identifier=@"activity-retention";Add(self.body,self.activityRetention);
-    [self refreshActivityFields];
+    [self refreshActivityIssues];[self refreshActivityFields];
 }
 - (void)refreshActivityIssues {
-    for(NSView *view in self.activityIssues.arrangedSubviews.copy){[self.activityIssues removeArrangedSubview:view];[view removeFromSuperview];}
+    if(!self.activityIssues)return;
     NSArray *issues=A(JasoWorkspaceStatus(self.snapshot,self.snapshotError,JasoUsesKorean())[@"issues"]);
+    if([self.activityIssuePresentation isEqual:issues])return;
+    self.activityIssuePresentation=[issues copy];
+    for(NSView *view in self.activityIssues.arrangedSubviews.copy){[self.activityIssues removeArrangedSubview:view];[view removeFromSuperview];}
     if(issues.count)Add(self.activityIssues,Label(W(@"Currently waiting",@"현재 대기 항목"),14,NSFontWeightSemibold));
     for(NSDictionary *issue in issues){WorkspaceButton *button=[WorkspaceButton buttonWithTitle:[NSString stringWithFormat:@"%@ — %@",S(issue[@"path"]).lastPathComponent,S(issue[@"title"])] target:self action:@selector(showIssue:)];button.record=issue;button.alignment=NSTextAlignmentLeft;button.lineBreakMode=NSLineBreakByTruncatingMiddle;button.toolTip=S(issue[@"path"]);[button setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];Add(self.activityIssues,button);}
     JasoApplyContentZoom(self.activityIssues);
 }
 - (void)refreshActivityFields {
-    [self refreshActivityIssues];
     if(!self.activityLocation)return;
     BOOL available=[N(self.activity[@"available"]) boolValue]&&!self.activityError.length;
     NSDictionary *live=available?D(self.activity[@"activity"]):@{};NSString *state=S(live[@"state"]),*phase=S(live[@"phase"]);
+    // Compare all saved event content, including occurrence/resolution changes.
+    // Generated clock fields do not invalidate rows; elapsed waiting crosses one
+    // visible heading threshold and must still update at that boundary.
+    BOOL lateMetadata=[N(live[@"phase_elapsed_seconds"]) doubleValue]>=10&&[state isEqual:@"waiting_metadata"]&&[@[@"opening_directory",@"reading_metadata",@"enumerating"] containsObject:phase];
+    NSMutableDictionary *content=[live mutableCopy];
+    [content removeObjectsForKeys:@[@"snapshot_generated_at",@"phase_elapsed_seconds",@"last_progress_age_seconds"]];
+    NSDictionary *semantic=@{@"live":content,@"available":@(available),@"error":self.activityError?:@"",@"lateMetadata":@(lateMetadata),@"filter":self.activityFilter,@"follow":@(self.followActivity)};
+    if([self.activitySemantic isEqual:semantic])return;
+    self.activitySemantic=semantic;
     // An inactive worker state is authoritative even if its last phase remains.
     NSString *headingPhase=[@[@"idle",@"paused",@"stopping",@"stopped"] containsObject:state]?state:phase;
     self.activityPhase.stringValue=[self phaseDescription:available?headingPhase:@""];
@@ -362,14 +424,30 @@ static NSView *Card(NSView *view) {
     if(![self.selectedActivitySession isEqual:S(live[@"session_id"])])self.selectedActivitySequence=nil;
     if(self.selectedActivitySequence){for(NSUInteger i=0;i<rows.count;i++)if([rows[i][@"sequence"] isEqual:self.selectedActivitySequence]){selected=i;break;}if(selected<0)self.selectedActivitySequence=nil;}
     self.activityRetention.stringValue=[N(live[@"dropped_events"]) unsignedLongLongValue]>0?[NSString stringWithFormat:W(@"%@ older activity entries have left this view. Completed name changes remain in History.",@"이전 활동 %@건은 이 목록에서 생략되었습니다. 완료된 이름 변경은 변경 기록에서 확인할 수 있습니다."),Count(live[@"dropped_events"])]:W(@"Recent activity appears here. Completed name changes are saved in History.",@"최근 활동을 표시합니다. 완료된 이름 변경은 변경 기록에 저장됩니다.");
-    self.restoringActivitySelection=YES;self.activityRows=rows;[self.activityTable reloadData];if(selected>=0&&selected<(NSInteger)rows.count)[self.activityTable selectRowIndexes:[NSIndexSet indexSetWithIndex:selected] byExtendingSelection:NO];if(selected<0)[self.activityTable deselectAll:nil];self.restoringActivitySelection=NO;
+    BOOL sameSession=[self.activityRowsSession isEqual:S(live[@"session_id"])];
+    if(!sameSession||![self.activityRows isEqual:rows]) {
+        NSArray *previous=self.activityRows;BOOL sameOrder=sameSession&&previous.count==rows.count;
+        NSMutableIndexSet *changed=NSMutableIndexSet.new;
+        if(sameOrder)for(NSUInteger i=0;i<rows.count;i++) {
+            if(![previous[i][@"sequence"] isEqual:rows[i][@"sequence"]]){sameOrder=NO;break;}
+            if(![previous[i] isEqual:rows[i]])[changed addIndex:i];
+        }
+        self.restoringActivitySelection=YES;self.activityRows=[rows copy];self.activityRowsSession=S(live[@"session_id"]);
+        if(sameOrder)[self.activityTable reloadDataForRowIndexes:changed columnIndexes:[NSIndexSet indexSetWithIndex:0]];
+        else [self.activityTable reloadData];
+        if(selected>=0&&selected<(NSInteger)rows.count)[self.activityTable selectRowIndexes:[NSIndexSet indexSetWithIndex:selected] byExtendingSelection:NO];
+        if(selected<0)[self.activityTable deselectAll:nil];self.restoringActivitySelection=NO;
+    }
     if(self.followActivity&&rows.count)[self.activityTable scrollRowToVisible:rows.count-1];else[self.activityTable.enclosingScrollView.contentView scrollToPoint:origin];
 }
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView { return self.activityRows.count; }
 - (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
     NSDictionary *event=D(self.activityRows[row]),*presentation=JasoActivityPresentation(event,JasoUsesKorean());
     id time=[presentation[@"resolved"] boolValue]?presentation[@"resolvedAt"]:(event[@"timestamp"]?:event[@"at"]);
-    NSTextField *label=Label([NSString stringWithFormat:@"%@  %@\n%@",Time(time),S(presentation[@"title"]),S(event[@"item_path"]?:event[@"path"]?:event[@"scope_path"])],11*self.contentZoom,NSFontWeightRegular);label.lineBreakMode=NSLineBreakByTruncatingMiddle;label.maximumNumberOfLines=2;label.toolTip=label.stringValue;return label;
+    NSTextField *label=[tableView makeViewWithIdentifier:@"activity-cell" owner:self];
+    if(!label){label=Label(@"",11*self.contentZoom,NSFontWeightRegular);label.identifier=@"activity-cell";label.lineBreakMode=NSLineBreakByTruncatingMiddle;label.maximumNumberOfLines=2;}
+    label.font=[NSFont systemFontOfSize:11*self.contentZoom];
+    label.stringValue=[NSString stringWithFormat:@"%@  %@\n%@",Time(time),S(presentation[@"title"]),S(event[@"item_path"]?:event[@"path"]?:event[@"scope_path"])];label.toolTip=label.stringValue;return label;
 }
 - (void)tableViewSelectionDidChange:(NSNotification *)notification { if(!self.restoringActivitySelection){self.followActivity=NO;self.followButton.state=NSControlStateValueOff;NSInteger row=self.activityTable.selectedRow;self.selectedActivitySequence=row>=0&&row<(NSInteger)self.activityRows.count?N(self.activityRows[row][@"sequence"]):nil;self.selectedActivitySession=S(D(self.activity[@"activity"])[@"session_id"]);} }
 - (void)filterActivity:(NSPopUpButton *)sender { self.activityFilter=sender.selectedItem.representedObject;[self refreshActivityFields]; }
@@ -409,7 +487,10 @@ static NSView *Card(NSView *view) {
 - (void)historyFilter:(NSPopUpButton *)sender { self.historyResult=sender.selectedItem.representedObject;self.historyOffset=0;[self loadHistory]; }
 - (void)historyDateChanged:(id)sender { self.historyDatePicker.enabled=self.historyDateToggle.state==NSControlStateValueOn;NSDateFormatter *date=NSDateFormatter.new;date.dateFormat=@"yyyy-MM-dd";self.historyDate=self.historyDatePicker.enabled?[date stringFromDate:self.historyDatePicker.dateValue]:nil;self.historyOffset=0;[self loadHistory]; }
 - (void)historyRefresh:(id)sender { [self loadHistory]; }
-- (void)refreshActivity:(id)sender { [self loadActivity];if(self.refreshHandler)self.refreshHandler(); }
+- (void)refreshActivity:(id)sender {
+    __weak typeof(self) weakSelf=self;[self request:@"activity" parameters:@{@"fresh":@YES} reply:^(NSDictionary *value,NSString *error){[weakSelf updateActivity:value error:error];}];
+    if(self.refreshHandler)self.refreshHandler();
+}
 - (void)showActivityItem:(id)sender {
     NSInteger row=self.activityTable.clickedRow;if(row<0||row>=(NSInteger)self.activityRows.count)return;
     NSDictionary *event=D(self.activityRows[row]),*presentation=JasoActivityPresentation(event,JasoUsesKorean());
@@ -436,7 +517,12 @@ static NSView *Card(NSView *view) {
 - (void)request:(NSString *)name parameters:(NSDictionary *)parameters reply:(JasoWorkspaceReply)reply {
     if(!self.requestHandler||self.closed||[self.pendingRequests containsObject:name])return;
     [self.pendingRequests addObject:name];__weak typeof(self) weakSelf=self;
-    self.requestHandler(name,parameters,^(NSDictionary *result,NSString *error){dispatch_async(dispatch_get_main_queue(),^{typeof(self) strongSelf=weakSelf;if(!strongSelf)return;[strongSelf.pendingRequests removeObject:name];if(!strongSelf.closed)reply(result,error);});});
+    self.requestHandler(name,parameters,^(NSDictionary *result,NSString *error){
+        void (^deliver)(void)=^{typeof(self) strongSelf=weakSelf;if(!strongSelf)return;[strongSelf.pendingRequests removeObject:name];if(!strongSelf.closed)reply(result,error);};
+        // Shared activity publication is already on main. Queueing it again
+        // would let an older completion run after a newer published snapshot.
+        if(NSThread.isMainThread)deliver();else dispatch_async(dispatch_get_main_queue(),deliver);
+    });
 }
 - (void)loadActivity { __weak typeof(self) weakSelf=self;[self request:@"activity" parameters:@{} reply:^(NSDictionary *value,NSString *error){[weakSelf updateActivity:value error:error];}]; }
 - (void)loadHistory {
@@ -449,13 +535,23 @@ static NSView *Card(NSView *view) {
 }
 - (void)updateSnapshot:(NSDictionary *)snapshot error:(NSString *)error updatedAt:(NSDate *)date {
     self.snapshot=snapshot;self.snapshotError=error;self.snapshotDate=date;
-    if([self.selectedSection isEqual:@"status"]){if(self.scroll)self.scrollPositions[@"status"]=[NSValue valueWithPoint:self.scroll.contentView.bounds.origin];[self render];}
+    if([self.selectedSection isEqual:@"status"])[self refreshStatusFields];
     if([self.selectedSection isEqual:@"activity"])[self refreshActivityIssues];
     [self.activityWindow updateSnapshot:snapshot error:error updatedAt:date];
 }
-- (void)updateActivity:(NSDictionary *)response error:(NSString *)error { self.activity=response;self.activityError=error;[self refreshActivityFields]; }
+- (void)updateActivity:(NSDictionary *)response error:(NSString *)error {
+    self.activity=ImmutableActivity(response);self.activityError=[error copy];
+    if(!self.closed) {
+        if([self.selectedSection isEqual:@"status"])[self refreshStatusFields];
+        else if([self.selectedSection isEqual:@"activity"])[self refreshActivityFields];
+    }
+    [self.activityWindow updateActivity:self.activity error:self.activityError];
+}
 - (void)updateHistory:(NSDictionary *)response error:(NSString *)error {
-    self.history=response;self.historyError=error;if([@[@"history",@"status"] containsObject:self.selectedSection]){if(self.scroll)self.scrollPositions[self.selectedSection]=[NSValue valueWithPoint:self.scroll.contentView.bounds.origin];[self render];}
+    BOOL changed=![self.history isEqual:response]||![(self.historyError?:@"") isEqual:error?:@""];
+    self.history=response;self.historyError=error;
+    if([self.selectedSection isEqual:@"status"])[self refreshStatusFields];
+    else if(changed&&[self.selectedSection isEqual:@"history"]){if(self.scroll)self.scrollPositions[@"history"]=[NSValue valueWithPoint:self.scroll.contentView.bounds.origin];[self render];}
 }
 - (void)setRefreshing:(BOOL)refreshing { self.busy=refreshing; }
 - (void)primary:(NSButton *)sender { if(!self.busy&&self.actionHandler)self.actionHandler(sender.identifier); }
@@ -577,6 +673,11 @@ static NSView *Card(NSView *view) {
 - (void)windowDidResize:(NSNotification *)notification { [self updateAdaptiveRows]; }
 - (void)visibilityChanged:(NSNotification *)notification { [self syncTimer]; }
 - (void)windowWillClose:(NSNotification *)notification { self.closed=YES;[self.timer invalidate];self.timer=nil;[self closeDetail:nil];if(self.actionHandler)self.actionHandler(@"cancel-preview");if(self.closeHandler)self.closeHandler(); }
+- (void)formattingChanged:(NSNotification *)notification {
+    if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{[self formattingChanged:notification];});return;}
+    TimeISO=nil;TimeLocal=nil;TimeDisplay=nil;
+    [self zoomChanged:notification];
+}
 - (void)reloadLocalization { [self rebuildNavigation];[self render];[self.activityWindow reloadLocalization]; }
 - (CGFloat)contentZoom { return JasoContentZoom(); }
 - (void)zoomIn:(id)sender { JasoSetContentZoom(self.contentZoom+.1); }

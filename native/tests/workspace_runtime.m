@@ -6,6 +6,7 @@
 #import "../macos/ContentZoom.h"
 #import "../macos/NamePresentation.h"
 #import "../macos/StatusPresentation.h"
+#include <sys/resource.h>
 
 @interface JasoWorkspaceWindowController (RuntimeFixture)
 - (void)openDetail:(NSString *)title;
@@ -17,6 +18,7 @@
 - (void)reviewRestore:(NSButton *)sender;
 - (void)confirmRestore:(NSButton *)sender;
 - (void)showRestoreResult:(NSDictionary *)result error:(NSString *)error request:(NSDictionary *)request;
+- (void)render;
 @end
 
 // Only replace presentation of a sheet, avoiding key-window/activation races.
@@ -242,7 +244,7 @@ static NSDictionary *Activity(NSString *session,NSArray<NSNumber *> *sequences,N
     return @{@"version":@1,@"available":@YES,@"activity":@{@"session_id":session,@"state":@"processing",
         @"phase":@"enumerating",@"scope_path":@"/disposable-fixture",@"item_path":NSNull.null,
         @"phase_elapsed_seconds":@1,@"last_progress_at":@100,@"counters":@{@"processed":@10,@"renamed":@3},
-        @"scope":@{@"processed":@10,@"observed":@10,@"total":NSNull.null},@"events":events,@"dropped_events":@(dropped)}};
+        @"scope":@{@"processed":@10,@"observed":@10,@"total":NSNull.null},@"events":[events copy],@"dropped_events":@(dropped)}};
 }
 static void SelectRow(JasoWorkspaceWindowController *workspace,NSInteger row) {
     NSTableView *table=[workspace valueForKey:@"activityTable"];
@@ -597,7 +599,180 @@ static void TestDetailZoom(void) {
     }
     printf("PASS real detail layout and EN/KO 200%% fonts for Activity causes/resolutions, history, issues, preview and restore results\n");
 }
-int main(void) {
+
+// Observe real AppKit work; the fixture never substitutes controller behavior.
+static NSUInteger FullReloads, PartialReloads, LabelCreations, PageRenders, OffMainRenders;
+static IMP OriginalReload, OriginalPartialReload, OriginalLabel, OriginalRender;
+static void CountReload(id table,SEL selector) { FullReloads++;((void(*)(id,SEL))OriginalReload)(table,selector); }
+static void CountPartialReload(id table,SEL selector,NSIndexSet *rows,NSIndexSet *columns) { PartialReloads+=rows.count;((void(*)(id,SEL,id,id))OriginalPartialReload)(table,selector,rows,columns); }
+static id CountLabel(id type,SEL selector,NSString *value) { LabelCreations++;return ((id(*)(id,SEL,id))OriginalLabel)(type,selector,value); }
+static void CountRender(id workspace,SEL selector) { if(!NSThread.isMainThread){OffMainRenders++;return;}PageRenders++;((void(*)(id,SEL))OriginalRender)(workspace,selector); }
+static void ObserveUI(BOOL start) {
+    Method reload=class_getInstanceMethod(NSTableView.class,@selector(reloadData));
+    Method partial=class_getInstanceMethod(NSTableView.class,@selector(reloadDataForRowIndexes:columnIndexes:));
+    Method label=class_getClassMethod(NSTextField.class,@selector(wrappingLabelWithString:));
+    Method render=class_getInstanceMethod(JasoWorkspaceWindowController.class,@selector(render));
+    if(start){
+        FullReloads=PartialReloads=LabelCreations=PageRenders=OffMainRenders=0;
+        OriginalReload=method_setImplementation(reload,(IMP)CountReload);
+        OriginalPartialReload=method_setImplementation(partial,(IMP)CountPartialReload);
+        OriginalLabel=method_setImplementation(label,(IMP)CountLabel);
+        OriginalRender=method_setImplementation(render,(IMP)CountRender);
+    } else {
+        method_setImplementation(reload,OriginalReload);method_setImplementation(partial,OriginalPartialReload);
+        method_setImplementation(label,OriginalLabel);method_setImplementation(render,OriginalRender);
+    }
+}
+static NSDictionary *AdvancedClock(NSDictionary *response,NSUInteger tick) {
+    NSMutableDictionary *live=[response[@"activity"] mutableCopy];
+    live[@"snapshot_generated_at"]=@(1000+tick);live[@"last_progress_age_seconds"]=@(tick);
+    live[@"phase_elapsed_seconds"]=@(tick);
+    return @{@"available":@YES,@"activity":[live copy]};
+}
+static void TestIncrementalPresentation(void) {
+    JasoWorkspaceWindowController *workspace=JasoWorkspaceWindowController.new;
+    NSDictionary *snapshot=@{@"running":@YES,@"paused":@NO,@"apply":@YES,@"pending_recovery":@NO,@"baseline_complete":@YES,@"pending_jobs":@0,
+        @"directory_retry_items":@[@{@"path":@"/disposable-fixture/wait",@"reason":@"Permission denied (os error 13)",@"attempts":@1}]};
+    [workspace updateSnapshot:snapshot error:nil updatedAt:NSDate.date];
+    [workspace selectSection:@"activity"];
+    NSDictionary *activity=Activity(@"incremental",@[@1,@2,@3],0);
+    [workspace updateActivity:activity error:nil];[workspace.window.contentView layoutSubtreeIfNeeded];
+    NSTableView *table=[workspace valueForKey:@"activityTable"];
+    NSView *issue=[(NSStackView *)[workspace valueForKey:@"activityIssues"] arrangedSubviews].lastObject;
+    SelectRow(workspace,1);
+    ObserveUI(YES);
+    @try {
+        for(NSUInteger tick=1;tick<=4;tick++)[workspace updateActivity:AdvancedClock(activity,tick) error:nil];
+        Require(FullReloads==0&&PartialReloads==0,@"Advancing only generated timestamps and age must not reload Activity rows");
+        Require(LabelCreations==0,@"An unchanged activity response must not recreate labels or current issue controls");
+        Require([(NSStackView *)[workspace valueForKey:@"activityIssues"] arrangedSubviews].lastObject==issue,@"An unchanged issue must retain its real control");
+        Require(table.selectedRow==1,@"Skipping unchanged rows must preserve the selected event");
+        NSMutableDictionary *live=[activity[@"activity"] mutableCopy];
+        NSMutableArray *events=[live[@"events"] mutableCopy];NSMutableDictionary *event=[events[1] mutableCopy];
+        event[@"kind"]=@"error";event[@"errno"]=@13;event[@"occurrences"]=@2;events[1]=event;live[@"events"]=events;
+        [workspace updateActivity:@{@"available":@YES,@"activity":live} error:nil];
+        Require(PartialReloads>0||FullReloads>0,@"A changed event with the same sequence must update its existing row");
+        Require([[[workspace valueForKey:@"activityRows"] objectAtIndex:1][@"occurrences"] isEqual:@2],@"Repeated observations must retain their updated occurrence count");
+        NSTextField *cell=(id)[workspace tableView:table viewForTableColumn:table.tableColumns.firstObject row:1];
+        Require([cell.stringValue containsString:@"Access was denied"],@"A same-sequence cause change must reach the visible cell");
+        NSUInteger beforeMutation=FullReloads+PartialReloads;
+        event[@"occurrences"]=@3;
+        Require([[[workspace valueForKey:@"activityRows"] objectAtIndex:1][@"occurrences"] isEqual:@2],@"A mutable caller payload must not alter the retained presentation snapshot before update");
+        [workspace updateActivity:@{@"available":@YES,@"activity":live} error:nil];
+        Require(FullReloads+PartialReloads>beforeMutation,@"An in-place nested event edit must invalidate its displayed row on the next update");
+        event=[event mutableCopy];event[@"resolved_at"]=@200;event[@"resolution"]=@"checked";events=[events mutableCopy];events[1]=event;live=[live mutableCopy];live[@"events"]=events;
+        [workspace updateActivity:@{@"available":@YES,@"activity":live} error:nil];
+        cell=(id)[workspace tableView:table viewForTableColumn:table.tableColumns.firstObject row:1];
+        Require([cell.stringValue containsString:@"Checked successfully later"]&&table.selectedRow==1,@"Resolution must update the selected row without changing its identity");
+        NSUInteger reloaded=FullReloads+PartialReloads;
+        live=[live mutableCopy];live[@"counters"]=@{@"processed":@99,@"renamed":@8};
+        [workspace updateActivity:@{@"available":@YES,@"activity":live} error:nil];
+        Require([[[workspace valueForKey:@"activityNumbers"] stringValue] containsString:@"99"]&&FullReloads+PartialReloads==reloaded,@"Counter changes update the header without reloading unchanged events");
+        [workspace updateActivity:nil error:@"Fixture disconnected"];
+        Require([[workspace valueForKey:@"activityRows"] count]==0&&[[workspace valueForKey:@"activityProgress"] isHidden],@"A read error must clear available rows and stop the indicator");
+        [workspace updateActivity:activity error:nil];
+        Require([[workspace valueForKey:@"activityRows"] count]==3,@"Recovery must restore rows even when the worker returns the earlier content");
+        [workspace selectSection:@"status"];
+        NSView *page=[workspace valueForKey:@"scroll"];
+        NSUInteger renders=PageRenders;
+        [workspace updateSnapshot:snapshot error:nil updatedAt:[NSDate dateWithTimeIntervalSinceNow:1]];
+        Require([workspace valueForKey:@"scroll"]==page&&PageRenders==renders,@"An unchanged status refresh must retain its page and controls");
+        NSMutableDictionary *stopped=[snapshot mutableCopy];stopped[@"running"]=@NO;
+        [workspace updateSnapshot:stopped error:nil updatedAt:NSDate.date];
+        Require([Find(workspace.window.contentView,@"workspace-status-title") isKindOfClass:NSTextField.class],@"A status transition must keep a visible current status heading");
+        [workspace selectSection:@"activity"];
+        Require([[workspace valueForKey:@"activityRows"] count]==3,@"Returning to Activity must initialize a new table from the retained content");
+        NSUInteger beforeZone=FullReloads+PartialReloads;
+        [NSNotificationCenter.defaultCenter postNotificationName:NSSystemTimeZoneDidChangeNotification object:nil];
+        Require(FullReloads+PartialReloads>beforeZone,@"A time-zone change must invalidate displayed Activity times");
+    } @finally {ObserveUI(NO);[workspace close];}
+    puts("PASS unchanged presentation, same-sequence updates, counters, errors, navigation and time-zone invalidation");
+}
+static void TestFormattingReadingState(void) {
+    JasoWorkspaceWindowController *workspace=JasoWorkspaceWindowController.new;
+    [workspace.window setContentSize:NSMakeSize(660,560)];[workspace selectSection:@"activity"];
+    NSMutableArray *sequences=NSMutableArray.new;for(NSUInteger i=1;i<=80;i++)[sequences addObject:@(i)];
+    [workspace updateActivity:Activity(@"formatting",sequences,0) error:nil];SelectRow(workspace,12);
+    [workspace.window.contentView layoutSubtreeIfNeeded];
+    NSTableView *table=[workspace valueForKey:@"activityTable"];
+    NSClipView *feed=table.enclosingScrollView.contentView;NSScrollView *outer=[workspace valueForKey:@"scroll"];
+    [feed scrollToPoint:NSMakePoint(0,NSMinY([table rectOfRow:10])+7)];[outer.contentView scrollToPoint:NSMakePoint(0,40)];
+    NSPoint feedOrigin=feed.bounds.origin,outerOrigin=outer.contentView.bounds.origin;
+    Require(feedOrigin.y>0&&outerOrigin.y>0,@"Formatting regression needs both reading positions away from zero");
+    ObserveUI(YES);
+    @try {
+        [NSNotificationCenter.defaultCenter postNotificationName:NSSystemTimeZoneDidChangeNotification object:nil];
+        table=[workspace valueForKey:@"activityTable"];feed=table.enclosingScrollView.contentView;outer=[workspace valueForKey:@"scroll"];
+        BOOL positionKept=fabs(feed.bounds.origin.y-feedOrigin.y)<1&&fabs(outer.contentView.bounds.origin.y-outerOrigin.y)<1&&table.selectedRow==12;
+        dispatch_semaphore_t posted=dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+            [NSNotificationCenter.defaultCenter postNotificationName:NSCurrentLocaleDidChangeNotification object:nil];dispatch_semaphore_signal(posted);
+        });
+        NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:2];
+        while(dispatch_semaphore_wait(posted,DISPATCH_TIME_NOW)!=0&&deadline.timeIntervalSinceNow>0)[NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.005]];
+        DrainReplies();
+        Require(positionKept&&OffMainRenders==0,[NSString stringWithFormat:@"Formatting must preserve both reading positions and render on main (position=%d, off-main=%lu)",positionKept,(unsigned long)OffMainRenders]);
+    } @finally {ObserveUI(NO);[workspace close];}
+    puts("PASS formatting preserves reading position and routes background notifications to main");
+}
+static void TestActivityPublication(void) {
+    JasoWorkspaceWindowController *main=JasoWorkspaceWindowController.new,*detached=JasoWorkspaceWindowController.new;
+    [main setValue:detached forKey:@"activityWindow"];
+    __block JasoWorkspaceReply pending=nil;
+    main.requestHandler=^(NSString *name,NSDictionary *parameters,JasoWorkspaceReply reply){(void)parameters;Require([name isEqual:@"activity"],@"Publication fixture only requests Activity");pending=reply;};
+    [main selectSection:@"activity"];[detached selectSection:@"activity"];
+    @try {
+        [main updateActivity:Activity(@"published-A",@[@1,@2],0) error:nil];
+        Require([[detached valueForKey:@"activityRows"] count]==2,@"A fresh shared result must immediately publish to the detached Activity view");
+        SelectRow(detached,1);
+        [main updateActivity:Activity(@"published-B",@[@1,@2],0) error:nil];
+        Require([(NSTableView *)[detached valueForKey:@"activityTable"] selectedRow]==-1,@"Published session restarts must clear detached selection");
+        [main setValue:@YES forKey:@"closed"];
+        [main updateActivity:nil error:@"Disconnected fixture"];
+        Require([[detached valueForKey:@"activityRows"] count]==0,@"A closed main window must still forward query failure to its detached view");
+        [main setValue:@NO forKey:@"closed"];
+        Require(pending!=nil,@"The ordering fixture must hold a real controller request completion");
+        pending(Activity(@"older-completion",@[@1],0),nil);
+        [main updateActivity:Activity(@"newer-publication",@[@1,@2,@3],0) error:nil];
+        DrainReplies();
+        Require([[[main valueForKey:@"activity"] objectForKey:@"activity"][@"session_id"] isEqual:@"newer-publication"]&&[[detached valueForKey:@"activityRows"] count]==3,@"An already-main completion must not queue an older result behind a newer shared publication");
+    } @finally {main.requestHandler=nil;[main setValue:nil forKey:@"activityWindow"];[main close];[detached close];}
+    puts("PASS immediate shared Activity publication and detached session/error updates");
+}
+static double CPUSeconds(struct rusage usage) { return usage.ru_utime.tv_sec+usage.ru_utime.tv_usec/1e6+usage.ru_stime.tv_sec+usage.ru_stime.tv_usec/1e6; }
+static void BenchmarkPresentation(BOOL active) {
+    JasoWorkspaceWindowController *activity=JasoWorkspaceWindowController.new,*status=JasoWorkspaceWindowController.new;
+    NSMutableArray *sequences=NSMutableArray.new;for(NSUInteger i=1;i<=200;i++)[sequences addObject:@(i)];
+    NSDictionary *response=Activity(@"benchmark",sequences,0);
+    NSDictionary *snapshot=@{@"running":@YES,@"paused":@NO,@"apply":@YES,@"pending_recovery":@NO,@"baseline_complete":@YES,@"pending_jobs":@0,
+        @"directory_retry_items":@[@{@"path":@"/disposable-fixture/wait",@"reason":@"Permission denied (os error 13)",@"attempts":@1}]};
+    [activity selectSection:@"activity"];[activity updateSnapshot:snapshot error:nil updatedAt:NSDate.date];[activity updateActivity:response error:nil];
+    [status updateSnapshot:snapshot error:nil updatedAt:NSDate.date];
+    [activity.window.contentView layoutSubtreeIfNeeded];[status.window.contentView layoutSubtreeIfNeeded];
+    ObserveUI(YES);struct rusage before,after;getrusage(RUSAGE_SELF,&before);double started=NSProcessInfo.processInfo.systemUptime;
+    for(NSUInteger tick=1;tick<=300;tick++){@autoreleasepool {
+        if(active){
+            NSMutableDictionary *live=[response[@"activity"] mutableCopy];live[@"counters"]=@{@"processed":@(tick),@"renamed":@(tick/10)};
+            if(tick%10==0){
+                NSMutableArray *events=[live[@"events"] mutableCopy];NSMutableDictionary *event=[events.lastObject mutableCopy];
+                event[@"kind"]=@"error";event[@"errno"]=@13;event[@"occurrences"]=@(tick/10);event[@"at"]=@(100+tick);
+                if(tick%20==0){event[@"resolved_at"]=@(101+tick);event[@"resolution"]=@"checked";}
+                else {[event removeObjectForKey:@"resolved_at"];[event removeObjectForKey:@"resolution"];}
+                events[events.count-1]=[event copy];live[@"events"]=[events copy];
+            }
+            if(tick>=150)live[@"session_id"]=@"benchmark-restarted";
+            response=@{@"available":@YES,@"activity":[live copy]};
+        }
+        [activity updateActivity:AdvancedClock(response,tick) error:nil];
+        if(tick%5==0){[activity updateSnapshot:snapshot error:nil updatedAt:NSDate.date];[status updateSnapshot:snapshot error:nil updatedAt:NSDate.date];}
+        [activity.window.contentView layoutSubtreeIfNeeded];[status.window.contentView layoutSubtreeIfNeeded];
+    }}
+    double wall=NSProcessInfo.processInfo.systemUptime-started;getrusage(RUSAGE_SELF,&after);ObserveUI(NO);
+    printf("{\"fixture\":\"%s\",\"ticks\":300,\"events\":200,\"wall_seconds\":%.6f,\"cpu_seconds\":%.6f,\"label_factory_calls\":%lu,\"table_full_reloads\":%lu,\"table_partial_rows\":%lu,\"page_renders\":%lu,\"peak_rss_bytes\":%ld}\n",active?"changing-activity-status":"unchanged-activity-status",wall,CPUSeconds(after)-CPUSeconds(before),(unsigned long)LabelCreations,(unsigned long)FullReloads,(unsigned long)PartialReloads,(unsigned long)PageRenders,after.ru_maxrss);
+    [activity close];[status close];
+}
+
+int main(int argc,const char **argv) {
     @autoreleasepool {
         NSString *suite=[@"jaso-workspace-runtime-" stringByAppendingString:NSUUID.UUID.UUIDString];
         TestDefaults=[[NSUserDefaults alloc] initWithSuiteName:suite];
@@ -608,6 +783,12 @@ int main(void) {
             [NSApplication sharedApplication];
             [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
             JasoSetLanguagePreference(@"en");
+            if(argc==2&&(strcmp(argv[1],"--benchmark")==0||strcmp(argv[1],"--benchmark-active")==0)){BenchmarkPresentation(strcmp(argv[1],"--benchmark-active")==0);return 0;}
+            NSMutableArray *performanceFailures=NSMutableArray.new;
+            for(void (^test)(void) in @[^ {TestActivityPublication();},^ {TestIncrementalPresentation();},^ {TestFormattingReadingState();}]){
+                @try {test();} @catch(NSException *failure){[performanceFailures addObject:failure.reason];}
+            }
+            Require(performanceFailures.count==0,[performanceFailures componentsJoinedByString:@"\n"]);
             TestRestoreAttribution();
             TestNameComparison();
             TestHistoryRowFocus();

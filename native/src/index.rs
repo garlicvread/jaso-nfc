@@ -1045,7 +1045,12 @@ impl Index {
                 if let Some(owner) = state.volume_for(&path)?
                     && state.accepts(&path)
                 {
-                    state.queue(&path, &owner, false, false, 0.0, true)?;
+                    // The existing job already owns this retry obligation,
+                    // including an incomplete snapshot or a directory backoff.
+                    // Rediscovery is not a new filesystem event/generation.
+                    if !state.has_retry_ticket(&path, &owner)? {
+                        state.queue(&path, &owner, false, false, 0.0, true)?;
+                    }
                 }
             }
             // Fresh intake and background traversal each receive a bounded burst.
@@ -1737,6 +1742,27 @@ impl State {
         }
         Ok(())
     }
+    fn has_retry_ticket(&self, path: &str, key: &str) -> Result<bool> {
+        let mut ancestor = path.to_owned();
+        loop {
+            let covered: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE path=? AND volume_key=? AND
+                 ((? AND (ordinary_scope>0 OR baseline=0 OR error IS NOT NULL)) OR
+                  (recursive=1 AND baseline=0)))",
+                params![ancestor, key, ancestor == path],
+                |row| row.get(0),
+            )?;
+            if covered {
+                return Ok(true);
+            }
+            let next = parent(&ancestor);
+            if next == ancestor {
+                return Ok(false);
+            }
+            ancestor = next;
+        }
+    }
+
     fn queue(
         &self,
         path: &str,

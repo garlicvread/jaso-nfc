@@ -2,9 +2,9 @@
 
 [한국어 사용 설명서](usage.md) · [English user guide](usage.en.md)
 
-[다운로드 / Download](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.0/Jaso-NFC-0.2.0-arm64-local.dmg) · [릴리스 정보 / Release notes](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.2.0)
+[다운로드 / Download](https://github.com/garlicvread/jaso-nfc/releases/download/v0.2.1/Jaso-NFC-0.2.1-arm64-local.dmg) · [릴리스 정보 / Release notes](https://github.com/garlicvread/jaso-nfc/releases/tag/v0.2.1)
 
-0.2.0 · Apple Silicon Mac · macOS 13 이상 / macOS 13 or later
+0.2.1 · Apple Silicon Mac · macOS 13 이상 / macOS 13 or later
 
 ## 설치하기 / Install the app
 

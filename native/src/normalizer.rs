@@ -468,6 +468,9 @@ pub struct Normalizer {
     pub pending_path: Option<PathBuf>,
     pub apply: bool,
     pub retry: RetryState,
+    retry_schedule: std::cell::RefCell<Option<RetrySchedule>>,
+    managed_retry_revision: Option<u64>,
+    managed_retry_save_pending: bool,
     journal: Option<Journal>,
     scans: HashMap<String, DirectoryScan>,
     last_completed: Option<Value>,
@@ -477,6 +480,24 @@ pub struct Normalizer {
     #[cfg(test)]
     hook: Option<RecoveryHook>,
 }
+
+/// Derived scheduling data, rebuilt only after record or policy changes. The
+/// original records remain the durable source of truth, including excluded ones.
+struct RetrySchedule {
+    revision: u64,
+    policy: Policy,
+    apply: bool,
+    latest: Option<f64>,
+    eligible: Vec<(f64, String)>,
+}
+fn same_policy(left: &Policy, right: &Policy) -> bool {
+    left.roots == right.roots
+        && left.excludes == right.excludes
+        && left.exclude_names == right.exclude_names
+        && left.skip_hidden_tops == right.skip_hidden_tops
+        && left.root_excludes == right.root_excludes
+}
+
 impl Normalizer {
     pub const RETRY_BASE: f64 = 900.;
     pub const RETRY_MAX: f64 = 86400.;
@@ -499,6 +520,9 @@ impl Normalizer {
             pending_path: pending,
             apply,
             retry: retry_state,
+            retry_schedule: std::cell::RefCell::new(None),
+            managed_retry_revision: None,
+            managed_retry_save_pending: false,
             journal: None,
             scans: HashMap::new(),
             last_completed: None,
@@ -1800,41 +1824,109 @@ impl Normalizer {
         }
     }
     pub fn next_retry_time(&self, checked_after: Option<f64>) -> Option<f64> {
-        self.retry
-            .entries
-            .iter()
-            .filter(|(path, record)| {
-                Self::accepts_retry(&self.policy, path, record)
-                    && checked_after.is_none_or(|time| record.next_retry > time)
-            })
-            .map(|(_, record)| record.next_retry)
-            .min_by(f64::total_cmp)
+        let schedule = self.retry_schedule();
+        let first = checked_after.map_or(0, |time| {
+            schedule.eligible.partition_point(|(due, _)| *due <= time)
+        });
+        schedule.eligible.get(first).map(|(due, _)| *due)
     }
+
+    fn retry_schedule_current(&self) -> bool {
+        self.retry_schedule
+            .borrow()
+            .as_ref()
+            .is_some_and(|schedule| {
+                schedule.revision == self.retry.entries.revision()
+                    && schedule.apply == self.apply
+                    && same_policy(&schedule.policy, &self.policy)
+            })
+    }
+
+    fn retry_schedule(&self) -> std::cell::Ref<'_, RetrySchedule> {
+        if !self.retry_schedule_current() {
+            // The old schedule is invalid. Release its strings before creating
+            // replacements, and reuse its row buffer instead of retaining two
+            // full registries during a rebuild.
+            let mut eligible = self
+                .retry_schedule
+                .borrow_mut()
+                .take()
+                .map(|schedule| schedule.eligible)
+                .unwrap_or_default();
+            eligible.clear();
+            let mut latest: Option<f64> = None;
+            for (path, record) in &self.retry.entries {
+                latest = Some(latest.map_or(record.next_retry, |time| time.max(record.next_retry)));
+                if Self::accepts_retry(&self.policy, path, record) {
+                    let parent = Path::new(path).parent().unwrap_or(Path::new("."));
+                    eligible.push((record.next_retry, parent.to_string_lossy().into_owned()));
+                }
+            }
+            if eligible.is_empty() {
+                // An emptied/excluded registry should release its historical
+                // row buffer instead of retaining it throughout idle time.
+                eligible = Vec::new();
+            }
+            let order = |left: &(f64, String), right: &(f64, String)| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+            };
+            eligible.sort_by(order);
+            *self.retry_schedule.borrow_mut() = Some(RetrySchedule {
+                revision: self.retry.entries.revision(),
+                policy: self.policy.clone(),
+                apply: self.apply,
+                latest,
+                eligible,
+            });
+        }
+        std::cell::Ref::map(self.retry_schedule.borrow(), |schedule| {
+            schedule.as_ref().unwrap()
+        })
+    }
+
     pub fn retry_paths(&mut self, time: f64) -> Result<Vec<String>> {
-        if self.apply {
+        if self.apply && self.managed_retry_revision != Some(self.retry.entries.revision()) {
             let count = self.retry.entries.len();
             self.retry
                 .entries
                 .retain(|path, _| !crate::policy::is_managed_cloud_path(path));
-            if self.retry.entries.len() != count {
+            self.managed_retry_save_pending |= self.retry.entries.len() != count;
+            if self.managed_retry_save_pending {
                 self.retry.save()?;
+                self.managed_retry_save_pending = false;
             }
+            self.managed_retry_revision = Some(self.retry.entries.revision());
         }
-        let mut due = BTreeSet::new();
-        for (path, record) in &mut self.retry.entries {
-            record.next_retry = record.next_retry.min(time + Self::RETRY_MAX);
-            // Discovery runs before every job. Keep it lexical and in memory;
-            // enqueue/reconcile enforce the full filesystem-aware policy.
-            if record.next_retry > time || !Self::accepts_retry(&self.policy, path, record) {
-                continue;
+        // A regressed wall clock or imported far-future deadline still obeys
+        // the existing maximum backoff. An unchanged clock/deadline set needs
+        // no map traversal; only actual clamping inspects the original records.
+        let ceiling = time + Self::RETRY_MAX;
+        let clamped: Vec<String> = {
+            let schedule = self.retry_schedule();
+            if schedule.latest.is_some_and(|latest| latest > ceiling) {
+                self.retry
+                    .entries
+                    .iter()
+                    .filter(|(_, record)| record.next_retry > ceiling)
+                    .map(|(path, _)| path.clone())
+                    .collect()
+            } else {
+                Vec::new()
             }
-            let parent = Path::new(&path)
-                .parent()
-                .unwrap_or(Path::new("."))
-                .to_string_lossy()
-                .into_owned();
-            due.insert(parent);
+        };
+        for path in clamped {
+            self.retry.entries.get_mut(&path).unwrap().next_retry = ceiling;
         }
+        // Discovery is lexical and read-only after cache construction. A due
+        // source remains discoverable until successful parent EOF retires it.
+        let schedule = self.retry_schedule();
+        let end = schedule.eligible.partition_point(|(due, _)| *due <= time);
+        let due: BTreeSet<String> = schedule.eligible[..end]
+            .iter()
+            .map(|(_, parent)| parent.clone())
+            .collect();
         Ok(due.into_iter().collect())
     }
     pub fn reconcile(&mut self, path: &str, recursive: bool) -> Result<ScanResult> {
@@ -3151,9 +3243,10 @@ mod tests {
         engine.retry.failure(&source, &destination, "dataless-file");
         // Only the saved metadata reports dataless; the disposable local file
         // now has ordinary flags. No provider or materialization is involved.
-        let record = engine.retry.entries.get_mut(&source).unwrap();
+        let mut record = engine.retry.entries.get_mut(&source).unwrap();
         record.signature[0][5] = json!(info.st_flags | 0x4000_0000);
         assert!(record.next_retry > crate::model::now());
+        drop(record);
         engine.journal = Some(Journal::standard(engine.log_path.as_ref().unwrap()).unwrap());
         let result = engine
             .rename_entry(
@@ -3957,6 +4050,76 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            RetryState::new(engine.retry_path.clone(), 900., 86400.)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn retry_schedule_tracks_edits_policy_rebasing_and_clock_regression() {
+        let (_temp, mut engine, root) = fixture();
+        engine.apply = false;
+        let first = root.join("folder/old").to_string_lossy().into_owned();
+        let second = root.join("folder/new").to_string_lossy().into_owned();
+        let parent = root.join("folder").to_string_lossy().into_owned();
+        let record = crate::journal::RetryRecord {
+            signature: vec![],
+            reason: "busy".into(),
+            count: 1,
+            last_failure: 0.,
+            next_retry: 100.,
+        };
+        engine.retry.entries.insert(first.clone(), record.clone());
+        assert_eq!(engine.next_retry_time(None), Some(100.));
+        assert!(engine.retry_paths(99.).unwrap().is_empty());
+        engine.retry.entries.get_mut(&first).unwrap().next_retry = 50.;
+        assert_eq!(engine.next_retry_time(None), Some(50.));
+        engine.retry.entries.insert(second.clone(), record);
+        assert_eq!(engine.retry_paths(100.).unwrap(), vec![parent.clone()]);
+        assert_eq!(engine.next_retry_time(Some(50.)), Some(100.));
+        engine.policy.excludes.push(parent.clone());
+        assert!(engine.retry_paths(100.).unwrap().is_empty());
+        assert_eq!(engine.next_retry_time(None), None);
+        engine.policy.excludes.clear();
+        let renamed = root.join("renamed").to_string_lossy().into_owned();
+        engine.rebase_retries(&parent, &renamed);
+        assert_eq!(engine.retry_paths(100.).unwrap(), vec![renamed.clone()]);
+        let first = format!("{renamed}/old");
+        engine.retry.entries.get_mut(&first).unwrap().next_retry = 1_000_000.;
+        assert_eq!(engine.next_retry_time(Some(100.)), Some(1_000_000.));
+        engine.retry_paths(10.).unwrap();
+        assert_eq!(
+            engine.retry.entries[&first].next_retry,
+            10. + Normalizer::RETRY_MAX
+        );
+        engine.retry.save().unwrap();
+        engine.retry = RetryState::new(engine.retry_path.clone(), 900., 86400.).unwrap();
+        assert_eq!(engine.next_retry_time(None), Some(100.));
+        engine.retry.entries.retain(|_, _| false);
+        assert_eq!(engine.next_retry_time(None), None);
+    }
+
+    #[test]
+    fn retry_wakeup_query_does_not_skip_managed_store_cleanup() {
+        let (_temp, mut engine, _root) = fixture();
+        let path = "/Users/jaso/Library/CloudStorage/GoogleDrive-user/.tmp/old";
+        engine.retry.entries.insert(
+            path.into(),
+            crate::journal::RetryRecord {
+                signature: vec![],
+                reason: "busy".into(),
+                count: 1,
+                last_failure: 0.,
+                next_retry: 1.,
+            },
+        );
+        engine.retry.save().unwrap();
+        engine.next_retry_time(None);
+        engine.retry_paths(2.).unwrap();
+        assert!(!engine.retry.entries.contains_key(path));
         assert!(
             RetryState::new(engine.retry_path.clone(), 900., 86400.)
                 .unwrap()

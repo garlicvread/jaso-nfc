@@ -265,7 +265,13 @@ int main(int argc, const char **argv) {
                 for (NSDictionary *request in requests) {
                     dispatch_semaphore_t finished = dispatch_semaphore_create(0);
                     [menu requestWorkspace:request[@"name"] parameters:request[@"parameters"] reply:^(NSDictionary *result, NSString *error) { dispatch_semaphore_signal(finished); }];
-                    Require(dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0, @"The request must finish through the bounded command fixture");
+                    // Activity publishes on main; keep that queue running while
+                    // the semaphore synchronizes both main and background replies.
+                    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1];
+                    long pending;
+                    while ((pending = dispatch_semaphore_wait(finished, DISPATCH_TIME_NOW)) != 0 && deadline.timeIntervalSinceNow > 0)
+                        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.01]];
+                    Require(pending == 0, @"The request must finish through the bounded command fixture");
                     NSArray *expected = [request[@"arguments"] arrayByAddingObjectsFromArray:@[@"--config",menu.configPath]];
                     Require([menu.commands.lastObject isEqual:expected], @"A workspace query must retain every literal argument and custom config path");
                 }

@@ -21,7 +21,59 @@ static BOOL Await(BOOL (^condition)(void),NSTimeInterval seconds) {
         [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.01]];
     return condition();
 }
+
+static NSUInteger ActivityLaunches(NSString *path) {
+    NSString *text=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    return text.length?[[text componentsSeparatedByString:@"\n"] count]-1:0;
+}
+static void TestSharedActivity(JasoMenu *menu,NSString *directory) {
+    NSString *savedWorker=menu.workerPath;menu.workerPath=NSProcessInfo.processInfo.arguments.firstObject;
+    menu.configPath=[directory stringByAppendingPathComponent:@"activity.calls"];
+    menu.statusWindow=JasoWorkspaceWindowController.new;
+    JasoWorkspaceWindowController *detached=JasoWorkspaceWindowController.new;
+    [menu.statusWindow setValue:detached forKey:@"activityWindow"];
+    __block NSUInteger replies=0;__block NSDictionary *first=nil,*second=nil,*third=nil;
+    [menu requestWorkspace:@"activity" parameters:@{} reply:^(NSDictionary *result,NSString *error){Require(NSThread.isMainThread,@"Shared Activity responses must arrive on main");Require(!error&&[result[@"available"] boolValue],@"First Activity reader must receive a successful fixture response");first=result;replies++;}];
+    [menu requestWorkspace:@"activity" parameters:@{} reply:^(NSDictionary *result,NSString *error){Require(!error&&[result[@"available"] boolValue],@"Second Activity reader must receive a successful fixture response");second=result;replies++;}];
+    // Keep main unpumped while the real worker and reader queue complete.
+    // A cache hit must not expose an unpublished result ahead of older fanout.
+    NSDate *readyDeadline=[NSDate dateWithTimeIntervalSinceNow:2];
+    while(ActivityLaunches(menu.configPath)==0&&readyDeadline.timeIntervalSinceNow>0)usleep(1000);
+    Require(ActivityLaunches(menu.configPath)==1,@"The publication-order fixture must start its owned worker");
+    dispatch_sync(menu.activityQueue,^{});
+    __block BOOL early=NO;
+    [menu requestWorkspace:@"activity" parameters:@{} reply:^(NSDictionary *result,NSString *error){Require(result&&!error,@"A poll joining completed but unpublished work must receive its result");third=result;early=YES;replies++;}];
+    Require(!early,@"A cache hit must not expose a completed result before its ordered main publication");
+    Require(Await(^BOOL{return replies==3;},4),@"Concurrent Activity consumers must all complete");
+    Require(ActivityLaunches(menu.configPath)==1,@"Concurrent Activity windows must share one real query process");
+    Require(first==second&&second==third,@"Concurrent Activity consumers must receive the same parsed snapshot");
+    Require([menu.statusWindow valueForKey:@"activity"]==first&&[detached valueForKey:@"activity"]==first,@"Every fresh query result must publish to both windows before their next timer tick");
+    [menu requestWorkspace:@"activity" parameters:@{} reply:^(NSDictionary *result,NSString *error){Require(result==first&&!error,@"A nearby window poll must reuse the shared parsed result");replies++;}];
+    Require(Await(^BOOL{return replies==4;},2)&&ActivityLaunches(menu.configPath)==1,@"The short result cache must avoid a duplicate nearby poll");
+    [menu requestWorkspace:@"activity" parameters:@{@"fresh":@YES} reply:^(NSDictionary *result,NSString *error){Require(result&&!error,@"Explicit refresh must complete");Require(![result[@"activity"][@"query_pid"] isEqual:first[@"activity"][@"query_pid"]],@"Explicit refresh must deliver newly fetched active state");Require([detached valueForKey:@"activity"]==result,@"Detached Activity must receive the fresh result without another poll");replies++;}];
+    Require(Await(^BOOL{return replies==5;},4)&&ActivityLaunches(menu.configPath)==2,@"Explicit refresh must bypass a recent cached Activity result");
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1.05]];
+    [menu requestWorkspace:@"activity" parameters:@{} reply:^(NSDictionary *result,NSString *error){Require(result&&!error,@"Expired Activity cache must query again");replies++;}];
+    Require(Await(^BOOL{return replies==6;},4)&&ActivityLaunches(menu.configPath)==3,@"The shared cache must expire within one normal polling interval");
+    menu.configPath=[directory stringByAppendingPathComponent:@"failure.calls"];
+    for(NSUInteger i=0;i<2;i++)[menu requestWorkspace:@"activity" parameters:@{} reply:^(NSDictionary *result,NSString *error){Require(!result&&error.length>0,@"A failed shared query must deliver its error to every waiting consumer");replies++;}];
+    Require(Await(^BOOL{return replies==8;},4)&&ActivityLaunches(menu.configPath)==1,@"The failing query must also be shared and complete both consumers");
+    Require([menu.statusWindow valueForKey:@"activity"]==nil&&[detached valueForKey:@"activity"]==nil,@"Query failure must immediately invalidate both windows' live state");
+    [menu requestWorkspace:@"activity" parameters:@{} reply:^(NSDictionary *result,NSString *error){Require(!result&&error.length>0,@"A following read must retry a failed query");replies++;}];
+    Require(Await(^BOOL{return replies==9;},4)&&ActivityLaunches(menu.configPath)==2,@"Errors must never be retained as a successful cached response");
+    Require(menu.activityReplies.count==0,@"Success and error publication must release every pending consumer");
+    [menu.statusWindow setValue:nil forKey:@"activityWindow"];[menu.statusWindow close];[detached close];menu.statusWindow=nil;
+    menu.workerPath=savedWorker;
+    puts("PASS shared Activity query/result publication, bounded cache expiry, explicit freshness and error recovery");
+}
+
 int main(int argc,const char **argv) {
+    if(argc==4&&strcmp(argv[1],"activity")==0&&strcmp(argv[2],"--config")==0){
+        int log=open(argv[3],O_WRONLY|O_CREAT|O_APPEND,0600);if(log<0)return 2;
+        dprintf(log,"%ld\n",(long)getpid());close(log);usleep(100000);
+        if(strstr(argv[3],"/failure.calls")){fputs("Owned query fixture failure\n",stderr);return 1;}
+        printf("{\"available\":true,\"activity\":{\"session_id\":\"owned-query-fixture\",\"query_pid\":%ld}}\n",(long)getpid());return 0;
+    }
     @autoreleasepool {
         if(argc!=2){fprintf(stderr,"usage: menu-queries-test /absolute/path/query-worker\n");return 2;}
         NSString *worker=@(argv[1]);
@@ -36,8 +88,10 @@ int main(int argc,const char **argv) {
         @try {
             Require(worker.isAbsolutePath&&[NSFileManager.defaultManager isExecutableFileAtPath:worker],@"The query fixture executable must be supplied explicitly");
             Require([NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:NO attributes:@{NSFilePosixPermissions:@0700} error:nil],@"The fixture needs an owned temporary directory");
+            [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
             JasoSetLanguagePreference(@"en");
             menu.workerPath=worker;
+            TestSharedActivity(menu,directory);
             NSArray *readyPaths=@[[directory stringByAppendingPathComponent:@"history.ready"],
                 [directory stringByAppendingPathComponent:@"preview.ready"]];
             NSArray *arguments=@[@[@"history",@"--ready",readyPaths[0]],@[@"setup",@"preview",@"--ready",readyPaths[1]]];

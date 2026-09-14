@@ -4,7 +4,7 @@ This guide is for maintainers who produce a Developer ID signed and notarized DM
 
 Local development builds are unchanged: they remain ad hoc signed and need no Apple account.
 
-Status at the time of writing: no Developer ID signed or notarized Jaso NFC artifact has been produced yet. The public download is still the 0.2.1 `-local` package, and the Gatekeeper guidance in [macOS blocks the installer](installation.md#macos-blocks-the-installer) describes that package correctly.
+Real company signing and notarization are NOT-VERIFIED in this change. The public download links still point to the 0.2.1 `-local` package, and the Gatekeeper guidance in [macOS blocks the installer](installation.md#macos-blocks-the-installer) describes that package correctly.
 
 ## Local and release modes
 
@@ -82,7 +82,7 @@ sh scripts/build-installer.sh --release --app 'dist/Jaso NFC.app'
 
 `sh scripts/build-native.sh --release` performs the local build and its checks, then signs the GUI executable `Contents/MacOS/Jaso NFC` first and the payload app second so that the app signature covers the Rust main executable `Contents/MacOS/jaso-nfc`. It uses the Developer ID Application identity with the hardened runtime and a secure timestamp on every executable, and verifies the signer, the exact Team ID, the runtime flag, and the timestamp. `--deep` is used only for verification, never for signing. Output: `dist/Jaso NFC.app`.
 
-`sh scripts/build-installer.sh --release --app 'dist/Jaso NFC.app'` packages an app that already carries the release signature; it repeats the signer, Team ID, runtime, and timestamp checks first. The `--app` input is never modified: the script works on its own staging copy, so the app under `dist/` stays as the native build left it. When `--app` is omitted, the installer build runs the native build in release mode first, as the local command does in local mode.
+`sh scripts/build-installer.sh --release --app 'dist/Jaso NFC.app'` requires a trusted payload built from the reviewed source; the input need not already carry the chosen Developer ID signature. The script copies the app to its own staging directory, adds `Contents/Resources/LICENSE.txt`, then signs and verifies that copy with the configured signer, Team ID, runtime, and timestamp before the first notarization. The original `--app` input is preserved. When `--app` is omitted, the installer build runs the native build in release mode first, as the local command does in local mode.
 
 The ordered signing and notarization sequence proceeds as follows:
 
@@ -96,15 +96,11 @@ The ordered signing and notarization sequence proceeds as follows:
 
 5. Round two (DMG): the DMG is submitted, must be `Accepted`, is stapled, and is validated.
 
-6. The SHA-256 checksum is computed last, after stapling, because stapling changes the DMG bytes. The final files are `dist/Jaso-NFC-<version>-<architecture>.dmg` and `dist/Jaso-NFC-<version>-<architecture>.dmg.sha256`; the script prints the DMG path as its last line. A failed or incomplete run leaves nothing at the final path.
+6. The SHA-256 checksum is computed last, after stapling, because stapling changes the DMG bytes. The final files are `dist/Jaso-NFC-<version>-<architecture>.dmg` and `dist/Jaso-NFC-<version>-<architecture>.dmg.sha256`; the script prints the DMG path as its last line. Failed runs do not publish a new or incomplete artifact; prior completed artifacts at the final paths are retained.
 
 Why two rounds: Apple requires a custom third-party installer to notarize and staple the installer's payload first and then notarize the packaged installer ([Customizing the notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)). For Jaso NFC this matters concretely: the installer app runs the payload's `jaso-nfc` executable from the mounted DMG, and the installed `/Applications/Jaso NFC.app` is a byte-identical copy of the payload. Stapling the DMG does not staple the app nested inside it, so the payload must carry its own ticket for launches after the DMG is ejected, including offline.
 
-Keep the submission id that `notarytool` prints; the command below downloads the log. Read the log even for an `Accepted` submission, because it can list warnings. Logs contain no credentials. No hardened-runtime entitlement exceptions are expected for this app; if the log or a test launch reports one, find the cause instead of adding an entitlement.
-
-```sh
-xcrun notarytool log <submission-id> --keychain-profile "$JASO_NOTARY_PROFILE" notary-log.json
-```
+The helper prints each receipt directory, not the raw submission ID. It automatically saves records under `build/notary.XXXXXX/payload` and `build/notary.XXXXXX/dmg`: `submission.json`, `submission.stderr.txt`, the retrieved `log.json` and `log-output.txt`, and `staple.txt` and `validate.txt` as those steps run. Failed runs retain the records reached before failure. Read `log.json` even for an `Accepted` submission, because it can list warnings; no duplicate manual log retrieval is needed. Logs are not a credential store; inspect them before sharing. No hardened-runtime entitlement exceptions are expected for this app; if the log or a test launch reports one, find the cause instead of adding an entitlement.
 
 ## Verify on the release Mac
 
@@ -135,7 +131,7 @@ These checks are static. They prove the artifact's signature and ticket on this 
 
 Use a test Mac with default Gatekeeper settings and no developer certificates: one with an existing 0.2.1 installation for the upgrade check, and one without prior Jaso NFC state for the clean-install check; notary acceptance is not proof of any item below.
 
-1. Download the DMG and its `.sha256` through a browser from the published URL, not by AirDrop or file copy, so the file carries the quarantine attribute. Confirm the attribute and the checksum with the commands below:
+1. Before public release, make the candidate DMG and its `.sha256` available at a controlled release-candidate download URL. Download them through a browser so the DMG carries the quarantine attribute. Confirm the attribute and the checksum with the commands below:
 
    ```sh
    cd ~/Downloads
@@ -145,13 +141,19 @@ Use a test Mac with default Gatekeeper settings and no developer certificates: o
 
 2. Open the DMG and double-click `Install Jaso NFC.app`. Expected: it opens with at most the standard confirmation for a downloaded app; it must not require `Open Anyway` in System Settings and must not show a damaged-file message. The installer runs the payload's `jaso-nfc` executable from the mounted DMG, so this step also exercises the payload signature.
 
-3. Complete the installation, choose the Trash option or keep the DMG, close the installer, and eject the disk. Then disconnect from the network and open `/Applications/Jaso NFC.app`. Expected: it launches without a network connection, which shows that the stapled ticket travelled with the installed copy.
+3. Complete the installation, choose the Trash option or keep the DMG, close the installer, and eject the disk. Validate the ticket on the installed copy:
+
+   ```sh
+   xcrun stapler validate '/Applications/Jaso NFC.app'
+   ```
+
+   Expected: validation succeeds. Then disconnect from the network and open `/Applications/Jaso NFC.app`; record whether it launches offline. An online first installation or launch can cache Gatekeeper decisions, so this offline launch only records the observed behavior and alone does not prove that the ticket was copied.
 
 4. Upgrade check on the Mac that had 0.2.1: after installation, the saved folders, exclusions, rename history in `History`, and login preference are still present, `Status` shows the prior state, and the worker is running. `startup status` in [worker and login controls](installation.md#worker-and-login-controls) reports the saved preference.
 
 5. Full Disk Access: the signing identity changes from ad hoc to Developer ID, so macOS can treat the release build as a different program. Check whether the existing Full Disk Access grant still applies; if the app reports access errors, follow [permissions](installation.md#permissions) to re-add `/Applications/Jaso NFC.app` and record that this step was needed so the release notes can say so.
 
-6. Login: log out and back in. Expected: the worker's LaunchAgent starts and the menu app appears; Jaso NFC is listed under Login Items as allowed in the background.
+6. Login: record the saved `startup status`, then log out and back in. If startup is enabled, expect the worker's LaunchAgent to start and the menu app to appear, with Jaso NFC allowed in the background under Login Items. If startup is disabled, it must remain disabled and the worker and menu app must not start automatically. Check both saved preferences across upgrade tests.
 
 7. Clean install on the Mac without prior state: expected a fresh installation that suggests Downloads, as described in [installation.md](installation.md).
 
@@ -159,9 +161,9 @@ Use a test Mac with default Gatekeeper settings and no developer certificates: o
 
 ## Publish
 
-Nothing in the repository publishes a release. Create the GitHub release for the tag `v<version>` manually and upload the DMG and its `.sha256` from the release Mac.
+This change does not publish a release. After the release-Mac and controlled-download checks pass and the operator explicitly decides to release, create the GitHub release for the tag `v<version>` manually and upload the verified DMG and its `.sha256` from the release Mac.
 
-Only after the notarized DMG is published, replace the download links, which currently point at `Jaso-NFC-0.2.1-arm64-local.dmg`, in `README.md`, `README.en.md`, `docs/usage.md`, `docs/usage.en.md`, `docs/installation.md`, `site/index.html`, and `site/en/index.html`, update the expected artifact name in `scripts/check-public-docs.py`, and run `python3 scripts/check-public-docs.py`. Revise [macOS blocks the installer](installation.md#macos-blocks-the-installer) and the matching user-guide section at the same time, since a notarized package no longer needs that workaround.
+Once the notarized artifact is available at its public URL, replace the download links, which currently point at `Jaso-NFC-0.2.1-arm64-local.dmg`, in `README.md`, `README.en.md`, `docs/usage.md`, `docs/usage.en.md`, `docs/installation.md`, `site/index.html`, and `site/en/index.html`, then run `python3 scripts/check-public-docs.py`. The checker accepts both local and signed artifact names; no filename rule edit is needed. Revise [macOS blocks the installer](installation.md#macos-blocks-the-installer) and the matching user-guide section at the same time, since a notarized package no longer needs that workaround.
 
 Until then, keep the `-local` links and the existing Gatekeeper guidance; they are correct for the package users can download today.
 
@@ -175,4 +177,4 @@ Keep the bundle identifiers `io.github.garlicvread.jaso-nfc`, `io.github.garlicv
 
 `python3 native/tests/test_release_signing.py` exercises the release preflight and sequencing with stubbed signing and notary tools. It needs no certificate or notary profile, and passing it is not evidence that a real artifact was signed or accepted.
 
-NOT VERIFIED at the time of writing: company team membership and roles, the existence of the certificate and notary profile, any notary acceptance, Gatekeeper behavior on first launch, Full Disk Access continuity after the identity change, upgrade from 0.2.1, and login behavior. Each of these needs a real release artifact and the checklist above. The Apple notary service and Gatekeeper requirements are summarized in Apple's [Notarizing macOS software before distribution](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
+NOT-VERIFIED in this change: company team membership and roles, the certificate and notary profile, real signing and notary acceptance, installed-app staple validation, Gatekeeper and offline-launch behavior, Full Disk Access continuity after the identity change, upgrade from 0.2.1, and login behavior for enabled and disabled startup preferences. These require operator evidence from the release setup and a real artifact tested with the checklist above. This change makes no claim about private artifacts outside its evidence. The Apple notary service and Gatekeeper requirements are summarized in Apple's [Notarizing macOS software before distribution](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).

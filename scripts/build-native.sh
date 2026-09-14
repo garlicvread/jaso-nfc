@@ -58,14 +58,13 @@ iconutil -c icns "$project_dir/build/JasoNFC.iconset" -o "$app_dir/Contents/Reso
 if [ -n "${JASO_ICON_PREVIEW_DIR:-}" ]; then
     "$project_dir/build/RenderIcon" --preview "$JASO_ICON_PREVIEW_DIR"
 fi
-# Fixtures copy executables and rewrite bundle metadata, so run them with the
-# local ad hoc signature before sealing the release with Developer ID.
+# The next two suites copy executables and rewrite bundle metadata, so run them
+# with the local ad hoc signature before sealing the release with Developer ID.
 codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc.menu "$app_dir/Contents/MacOS/Jaso NFC"
 codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc "$app_dir"
 codesign --verify --deep --strict "$app_dir"
 JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_app_trampoline.py
 JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_installed_runtime.py
-JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_workspace_cli.py
 if [ "$release" = 1 ]; then
     # The helper signs nested code first, then the app, and verifies the final
     # signer, team, hardened runtime and secure timestamps. Smoke the intact app.
@@ -73,4 +72,6 @@ if [ "$release" = 1 ]; then
     "$app_dir/Contents/MacOS/jaso-nfc" --version
     "$app_dir/Contents/MacOS/jaso-nfc" --help
 fi
+# Workspace checks execute the intact binary in place, after final release signing.
+JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_workspace_cli.py
 printf '%s\n' "$app_dir"

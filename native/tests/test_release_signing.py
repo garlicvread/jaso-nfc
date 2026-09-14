@@ -20,7 +20,8 @@ from unittest import mock
 PROJECT = Path(__file__).resolve().parents[2]
 TEAM = "ABCDE12345"
 IDENTITY = f"Developer ID Application: Fixture Company ({TEAM})"
-NATIVE_FIXTURES = ("test_app_trampoline.py", "test_installed_runtime.py", "test_workspace_cli.py")
+NATIVE_COPY_FIXTURES = ("test_app_trampoline.py", "test_installed_runtime.py")
+NATIVE_FIXTURES = (*NATIVE_COPY_FIXTURES, "test_workspace_cli.py")
 
 # ReleaseSigning shadows every signing/notary command, even in missing-input tests.
 # No fixture switch is implemented in production scripts.
@@ -167,8 +168,9 @@ with (tools / "events.jsonl").open("a") as stream:
     stream.write(json.dumps(["native-fixture", name, os.environ["JASO_NATIVE_BINARY"]]) + "\n")
 events = [json.loads(line) for line in (tools / "events.jsonl").read_text().splitlines()]
 signs = [event for event in events if event[0] == "codesign" and "--sign" in event]
-assert signs and signs[-1][signs[-1].index("--sign") + 1] == "-", \
-    "Bundle-mutating fixtures must run before the final Developer ID signature"
+if name != "test_workspace_cli.py":
+    assert signs and signs[-1][signs[-1].index("--sign") + 1] == "-", \
+        "Bundle-mutating fixtures must run before the final Developer ID signature"
 if json.loads((tools / "state.json").read_text()).get("fail_native_fixture") == name:
     raise SystemExit(23)
 '''
@@ -623,15 +625,16 @@ class ReleaseSigning(unittest.TestCase):
         binary = str((self.project / "dist/Jaso NFC.app/Contents/MacOS/jaso-nfc").resolve())
         self.assertTrue(all(event[2] == binary for _, event in fixtures))
         self.assertLess(signs[1][0], fixtures[0][0])
-        self.assertLess(fixtures[-1][0], signs[2][0])
+        self.assertLess(fixtures[1][0], signs[2][0])
         smoke = [(index, event) for index, event in enumerate(events) if event[0] == "native-cli"]
         self.assertEqual([event[1:] for _, event in smoke], [[binary, "--version"], [binary, "--help"]])
         last_verify = max(index for index, event in enumerate(events) if "--verify" in event)
         self.assertLess(signs[-1][0], last_verify)
         self.assertLess(last_verify, smoke[0][0])
+        self.assertLess(smoke[-1][0], fixtures[-1][0])
 
     def test_native_fixture_failure_prevents_final_signing(self):
-        for index, name in enumerate(NATIVE_FIXTURES):
+        for index, name in enumerate(NATIVE_COPY_FIXTURES):
             with self.subTest(fixture=name):
                 self.configure(fail_native_fixture=name)
                 (self.tools / "events.jsonl").unlink(missing_ok=True)
@@ -644,13 +647,27 @@ class ReleaseSigning(unittest.TestCase):
                 self.assertTrue(all(event[event.index("--sign") + 1] == "-" for event in signs))
                 self.assertFalse(any(event[0] == "native-cli" for event in events))
 
+    def test_native_workspace_failure_is_fatal_after_final_signing(self):
+        self.configure(fail_native_fixture="test_workspace_cli.py")
+        result = self.execute(["sh", "scripts/build-native.sh", "--release"])
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        events = self.events()
+        self.assertEqual([event[1] for event in events if event[0] == "native-fixture"],
+                         list(NATIVE_FIXTURES))
+        signs = [event for event in events if "--sign" in event]
+        self.assertEqual([event[event.index("--sign") + 1] for event in signs],
+                         ["-", "-", IDENTITY, IDENTITY])
+        self.assertEqual([event[-1] for event in events if event[0] == "native-cli"],
+                         ["--version", "--help"])
+        self.assertEqual(events[-1][:2], ["native-fixture", "test_workspace_cli.py"])
+
     def test_native_signature_failure_prevents_signed_cli(self):
         self.configure(bad_metadata="runtime")
         result = self.execute(["sh", "scripts/build-native.sh", "--release"])
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Missing hardened runtime", result.stderr)
         self.assertEqual([event[1] for event in self.events() if event[0] == "native-fixture"],
-                         list(NATIVE_FIXTURES))
+                         list(NATIVE_COPY_FIXTURES))
         self.assertFalse(any(event[0] == "native-cli" for event in self.events()))
 
     def test_native_signed_cli_failure_is_fatal(self):
@@ -662,6 +679,8 @@ class ReleaseSigning(unittest.TestCase):
                 self.assertEqual(result.returncode, 29, result.stdout + result.stderr)
                 smoke = [event[-1] for event in self.events() if event[0] == "native-cli"]
                 self.assertEqual(smoke, ["--version"] if argument == "--version" else ["--version", "--help"])
+                self.assertEqual([event[1] for event in self.events() if event[0] == "native-fixture"],
+                                 list(NATIVE_COPY_FIXTURES))
 
     def test_local_mode_has_no_credential_dependency(self):
         self.env = {key: value for key, value in self.env.items() if not key.startswith("JASO_")}

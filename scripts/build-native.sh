@@ -58,15 +58,19 @@ iconutil -c icns "$project_dir/build/JasoNFC.iconset" -o "$app_dir/Contents/Reso
 if [ -n "${JASO_ICON_PREVIEW_DIR:-}" ]; then
     "$project_dir/build/RenderIcon" --preview "$JASO_ICON_PREVIEW_DIR"
 fi
-# Sign nested code first, then let the app signature cover its Rust main.
-if [ "$release" = 1 ]; then
-    python3 scripts/release_signing.py sign payload "$app_dir"
-else
-    codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc.menu "$app_dir/Contents/MacOS/Jaso NFC"
-    codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc "$app_dir"
-    codesign --verify --deep --strict "$app_dir"
-fi
+# Fixtures copy executables and rewrite bundle metadata, so run them with the
+# local ad hoc signature before sealing the release with Developer ID.
+codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc.menu "$app_dir/Contents/MacOS/Jaso NFC"
+codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc "$app_dir"
+codesign --verify --deep --strict "$app_dir"
 JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_app_trampoline.py
 JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_installed_runtime.py
 JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_workspace_cli.py
+if [ "$release" = 1 ]; then
+    # The helper signs nested code first, then the app, and verifies the final
+    # signer, team, hardened runtime and secure timestamps. Smoke the intact app.
+    python3 scripts/release_signing.py sign payload "$app_dir"
+    "$app_dir/Contents/MacOS/jaso-nfc" --version
+    "$app_dir/Contents/MacOS/jaso-nfc" --help
+fi
 printf '%s\n' "$app_dir"

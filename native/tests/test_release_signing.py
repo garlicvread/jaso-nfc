@@ -20,6 +20,7 @@ from unittest import mock
 PROJECT = Path(__file__).resolve().parents[2]
 TEAM = "ABCDE12345"
 IDENTITY = f"Developer ID Application: Fixture Company ({TEAM})"
+NATIVE_FIXTURES = ("test_app_trampoline.py", "test_installed_runtime.py", "test_workspace_cli.py")
 
 # ReleaseSigning shadows every signing/notary command, even in missing-input tests.
 # No fixture switch is implemented in production scripts.
@@ -43,7 +44,7 @@ elif command == "codesign":
             info = plistlib.loads((path / "Contents/Info.plist").read_bytes())
             path = path / "Contents/MacOS" / info["CFBundleExecutable"]
         with path.open("ab") as stream:
-            stream.write(b"\nSIGNATURE FIXTURE\n")
+            stream.write(b"\n# SIGNATURE FIXTURE\n")
     elif "--display" in args:
         bad = state.get("bad_metadata")
         arch = args[args.index("--architecture") + 1] if "--architecture" in args else None
@@ -116,7 +117,18 @@ elif command == "clang":
 elif command == "cargo":
     target = pathlib.Path("target/release/jaso-nfc")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("#!/bin/sh\necho 'jaso-nfc 0.2.1'\n")
+    target.write_text(f"#!{sys.executable}\nTOOLS = {str(tools)!r}\n" + r"""
+import json, pathlib, sys
+tools = pathlib.Path(TOOLS)
+args = sys.argv[1:]
+with (tools / "events.jsonl").open("a") as stream:
+    stream.write(json.dumps(["native-cli", sys.argv[0], *args]) + "\n")
+assert args in (["--version"], ["--help"]), "Only safe CLI smoke checks are allowed"
+state = json.loads((tools / "state.json").read_text())
+if state.get("fail_native_smoke") == args[0]:
+    raise SystemExit(29)
+print("jaso-nfc 0.2.1" if args == ["--version"] else "Usage: jaso-nfc <COMMAND>")
+""")
     target.chmod(0o755)
 elif command == "iconutil":
     pathlib.Path(args[args.index("-o") + 1]).write_text("ICON FIXTURE")
@@ -145,6 +157,20 @@ elif command in ("mv", "ln"):
     sys.exit(status)
 else:
     raise AssertionError(command)
+'''
+
+NATIVE_CHECK = r'''
+import json, os, pathlib
+tools = pathlib.Path(__file__).resolve().parents[3] / "tools"
+name = pathlib.Path(__file__).name
+with (tools / "events.jsonl").open("a") as stream:
+    stream.write(json.dumps(["native-fixture", name, os.environ["JASO_NATIVE_BINARY"]]) + "\n")
+events = [json.loads(line) for line in (tools / "events.jsonl").read_text().splitlines()]
+signs = [event for event in events if event[0] == "codesign" and "--sign" in event]
+assert signs and signs[-1][signs[-1].index("--sign") + 1] == "-", \
+    "Bundle-mutating fixtures must run before the final Developer ID signature"
+if json.loads((tools / "state.json").read_text()).get("fail_native_fixture") == name:
+    raise SystemExit(23)
 '''
 
 PACKAGE_CHECK = r'''
@@ -222,8 +248,8 @@ class ReleaseSigning(unittest.TestCase):
             destination = self.project / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(PROJECT / name, destination)
-        for name in ("test_app_trampoline.py", "test_installed_runtime.py", "test_workspace_cli.py"):
-            (self.project / "native/tests" / name).write_text("# Compilation/runtime fixture only.\n")
+        for name in NATIVE_FIXTURES:
+            (self.project / "native/tests" / name).write_text(NATIVE_CHECK)
         (self.project / "native/tests/test_installer_package.py").write_text(PACKAGE_CHECK)
         self.app = self.root / "caller/Jaso NFC.app"
         (self.app / "Contents/MacOS").mkdir(parents=True)
@@ -583,12 +609,59 @@ class ReleaseSigning(unittest.TestCase):
         self.assertLess(next(index for index, event in enumerate(events) if event[0] == "security"),
                         next(index for index, event in enumerate(events) if event[0] == "cargo"))
         self.assertFalse(any(event[0] == "xcrun" for event in events))
-        signs = [event for event in events if "--sign" in event]
-        self.assertEqual(len(signs), 2)
-        for event in signs:
+        signs = [(index, event) for index, event in enumerate(events) if "--sign" in event]
+        self.assertEqual([event[event.index("--sign") + 1] for _, event in signs],
+                         ["-", "-", IDENTITY, IDENTITY])
+        for _, event in signs[2:]:
             self.assertEqual(event[event.index("--sign") + 1], IDENTITY)
             self.assertEqual(event[event.index("--options") + 1], "runtime")
             self.assertIn("--timestamp", event)
+            self.assertNotIn("--deep", event)
+            self.assertNotIn("--entitlements", event)
+        fixtures = [(index, event) for index, event in enumerate(events) if event[0] == "native-fixture"]
+        self.assertEqual([event[1] for _, event in fixtures], list(NATIVE_FIXTURES))
+        binary = str((self.project / "dist/Jaso NFC.app/Contents/MacOS/jaso-nfc").resolve())
+        self.assertTrue(all(event[2] == binary for _, event in fixtures))
+        self.assertLess(signs[1][0], fixtures[0][0])
+        self.assertLess(fixtures[-1][0], signs[2][0])
+        smoke = [(index, event) for index, event in enumerate(events) if event[0] == "native-cli"]
+        self.assertEqual([event[1:] for _, event in smoke], [[binary, "--version"], [binary, "--help"]])
+        last_verify = max(index for index, event in enumerate(events) if "--verify" in event)
+        self.assertLess(signs[-1][0], last_verify)
+        self.assertLess(last_verify, smoke[0][0])
+
+    def test_native_fixture_failure_prevents_final_signing(self):
+        for index, name in enumerate(NATIVE_FIXTURES):
+            with self.subTest(fixture=name):
+                self.configure(fail_native_fixture=name)
+                (self.tools / "events.jsonl").unlink(missing_ok=True)
+                result = self.execute(["sh", "scripts/build-native.sh", "--release"])
+                self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+                events = self.events()
+                self.assertEqual([event[1] for event in events if event[0] == "native-fixture"],
+                                 list(NATIVE_FIXTURES[:index + 1]))
+                signs = [event for event in events if "--sign" in event]
+                self.assertTrue(all(event[event.index("--sign") + 1] == "-" for event in signs))
+                self.assertFalse(any(event[0] == "native-cli" for event in events))
+
+    def test_native_signature_failure_prevents_signed_cli(self):
+        self.configure(bad_metadata="runtime")
+        result = self.execute(["sh", "scripts/build-native.sh", "--release"])
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Missing hardened runtime", result.stderr)
+        self.assertEqual([event[1] for event in self.events() if event[0] == "native-fixture"],
+                         list(NATIVE_FIXTURES))
+        self.assertFalse(any(event[0] == "native-cli" for event in self.events()))
+
+    def test_native_signed_cli_failure_is_fatal(self):
+        for argument in ("--version", "--help"):
+            with self.subTest(argument=argument):
+                self.configure(fail_native_smoke=argument)
+                (self.tools / "events.jsonl").unlink(missing_ok=True)
+                result = self.execute(["sh", "scripts/build-native.sh", "--release"])
+                self.assertEqual(result.returncode, 29, result.stdout + result.stderr)
+                smoke = [event[-1] for event in self.events() if event[0] == "native-cli"]
+                self.assertEqual(smoke, ["--version"] if argument == "--version" else ["--version", "--help"])
 
     def test_local_mode_has_no_credential_dependency(self):
         self.env = {key: value for key, value in self.env.items() if not key.startswith("JASO_")}
@@ -601,6 +674,9 @@ class ReleaseSigning(unittest.TestCase):
         signs = [event for event in self.events() if event[0] == "codesign" and "--sign" in event]
         self.assertEqual(len(signs), 3)
         self.assertTrue(all(event[event.index("--sign") + 1] == "-" for event in signs))
+        self.assertEqual([event[1] for event in self.events() if event[0] == "native-fixture"],
+                         list(NATIVE_FIXTURES))
+        self.assertFalse(any(event[0] == "native-cli" for event in self.events()))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ This guide is for maintainers who produce a Developer ID signed and notarized DM
 
 Local development builds are unchanged: they remain ad hoc signed and need no Apple account.
 
-Real company signing and notarization are NOT-VERIFIED in this change. The public download links still point to the 0.2.1 `-local` package, and the Gatekeeper guidance in [macOS blocks the installer](installation.md#macos-blocks-the-installer) describes that package correctly.
+Credential-free source tests do not verify real company signing or notarization; record those results separately for each release artifact. The public download links still point to the 0.2.1 `-local` package, and the Gatekeeper guidance in [macOS blocks the installer](installation.md#macos-blocks-the-installer) describes that package correctly.
 
 ## Local and release modes
 
@@ -80,7 +80,7 @@ sh scripts/build-native.sh --release
 sh scripts/build-installer.sh --release --app 'dist/Jaso NFC.app'
 ```
 
-`sh scripts/build-native.sh --release` performs the local build and its checks, then signs the GUI executable `Contents/MacOS/Jaso NFC` first and the payload app second so that the app signature covers the Rust main executable `Contents/MacOS/jaso-nfc`. It uses the Developer ID Application identity with the hardened runtime and a secure timestamp on every executable, and verifies the signer, the exact Team ID, the runtime flag, and the timestamp. `--deep` is used only for verification, never for signing. Output: `dist/Jaso NFC.app`.
+`sh scripts/build-native.sh --release` performs the local build and its checks, including all three Python bundle fixture suites against the ad hoc signed app. The fixtures copy executables and replace or remove bundle metadata, so they must run before the final Developer ID signature. Once they pass, the script signs the GUI executable `Contents/MacOS/Jaso NFC` first and the payload app second so that the app signature covers the Rust main executable `Contents/MacOS/jaso-nfc`. It uses the Developer ID Application identity with the hardened runtime and a secure timestamp on every executable, and verifies the signer, the exact Team ID, the runtime flag, and the timestamp. It then runs `--version` and `--help` on the intact signed app's Rust executable; either failure stops the build. `--deep` is used only for verification, never for signing. Output after successful completion: `dist/Jaso NFC.app`.
 
 `sh scripts/build-installer.sh --release --app 'dist/Jaso NFC.app'` requires a trusted payload built from the reviewed source; the input need not already carry the chosen Developer ID signature. The script copies the app to its own staging directory, adds `Contents/Resources/LICENSE.txt`, then signs and verifies that copy with the configured signer, Team ID, runtime, and timestamp before the first notarization. The original `--app` input is preserved. When `--app` is omitted, the installer build runs the native build in release mode first, as the local command does in local mode.
 

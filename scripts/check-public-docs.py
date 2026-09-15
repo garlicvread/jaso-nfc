@@ -223,9 +223,13 @@ def main() -> int:
             url_path = unquote(url.path)
             release_prefix = REPOSITORY + "/releases/download/"
             if url.hostname == "github.com" and url_path.startswith(release_prefix):
-                expected = f"{release_prefix}v{version}/Jaso-NFC-{version}-arm64-local.dmg"
-                if url_path not in (expected, expected + ".sha256"):
-                    error(path, line, f"download {target!r} does not match Cargo.toml {version}; expected https://github.com{expected}")
+                # Both build modes have stable names. Existing public links stay
+                # on -local until an actual signed release has been published;
+                # accepting a name here does not check external availability.
+                expected = tuple(f"{release_prefix}v{version}/Jaso-NFC-{version}-arm64{mode}.dmg{checksum}"
+                                 for mode in ("-local", "") for checksum in ("", ".sha256"))
+                if url_path not in expected:
+                    error(path, line, f"download {target!r} does not match Cargo.toml {version}; expected a versioned arm64 local or release DMG/checksum")
             pages_link = url.hostname == PAGES_HOST
             blob_prefix = REPOSITORY + "/blob/main/"
             repository_link = url.hostname == "github.com" and url_path.startswith(blob_prefix)

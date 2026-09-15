@@ -2,6 +2,7 @@
 import hashlib
 import os
 from pathlib import Path
+import platform
 import plistlib
 import shutil
 import subprocess
@@ -10,8 +11,12 @@ import tempfile
 import unittest
 
 PROJECT = Path(__file__).resolve().parents[2]
-PACKAGE = Path(os.environ.get("JASO_INSTALLER_DMG", PROJECT / "dist/installer.dmg"))
 PAYLOAD = Path(os.environ.get("JASO_INSTALLER_PAYLOAD", PROJECT / "dist/Jaso NFC.app"))
+RELEASE = os.environ.get("JASO_RELEASE_MODE", "0") == "1"
+VERSION = plistlib.loads((PROJECT / "native/macos/Info.plist").read_bytes())["CFBundleShortVersionString"]
+SUFFIX = "" if RELEASE else "-local"
+PACKAGE = Path(os.environ.get("JASO_INSTALLER_DMG",
+               PROJECT / f"dist/Jaso-NFC-{VERSION}-{platform.machine()}{SUFFIX}.dmg"))
 
 
 @unittest.skipUnless(sys.platform == "darwin", "DMG requires macOS")
@@ -56,7 +61,8 @@ class InstallerPackage(unittest.TestCase):
             self.assertEqual(set(architecture), set(architectures[0]),
                              "Installer and payload must support the same architectures")
         version = plistlib.loads((self.app / "Contents/Info.plist").read_bytes())["CFBundleShortVersionString"]
-        self.assertEqual(PACKAGE.name, f"Jaso-NFC-{version}-{'-'.join(architectures[0])}-local.dmg")
+        suffix = "" if RELEASE else "-local"
+        self.assertEqual(PACKAGE.name, f"Jaso-NFC-{version}-{'-'.join(architectures[0])}{suffix}.dmg")
 
     def test_payload_matches_the_tested_application(self):
         original = {str(p.relative_to(PAYLOAD)): p for p in PAYLOAD.rglob("*") if p.is_file()}
@@ -81,7 +87,24 @@ class InstallerPackage(unittest.TestCase):
                          "Preview filenames", "Start automatic cleanup", "https://github.com/garlicvread/jaso-nfc", "설치"):
             self.assertIn(required, instructions)
         self.assertEqual((self.mount / "LICENSE.txt").read_bytes(), (PROJECT / "LICENSE").read_bytes())
+        self.assertEqual((self.app / "Contents/Resources/LICENSE.txt").read_bytes(),
+                         (PROJECT / "LICENSE").read_bytes())
         self.assertFalse((self.mount / "Applications").exists(), "Do not imply unsupported drag-drop setup")
+
+    @unittest.skipUnless(RELEASE, "Local packages use ad hoc signing without notarization")
+    def test_release_signatures_and_notarization(self):
+        sys.path.insert(0, str(PROJECT / "scripts"))
+        import release_signing
+        release_signing.verify("installer", self.installer)
+        release_signing.verify("dmg", PACKAGE)
+        for path in (self.app, PACKAGE):
+            subprocess.run(["xcrun", "stapler", "validate", str(path)],
+                           check=True, capture_output=True)
+        # These are static assessments of the completed distribution. They do
+        # not install the app, test downloaded quarantine, or establish FDA access.
+        release_signing.assess("payload", self.app)
+        release_signing.assess("installer", self.installer)
+        release_signing.assess("dmg", PACKAGE)
 
     def test_read_only_volume_and_checksum(self):
         self.assertTrue(os.statvfs(self.mount).f_flag & os.ST_RDONLY)

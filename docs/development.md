@@ -13,6 +13,7 @@ cargo test --locked
 cargo build --locked
 python3 native/tests/test_cli.py
 python3 native/tests/test_app_trampoline.py
+python3 native/tests/test_release_signing.py
 sh scripts/build-native.sh
 ```
 
@@ -20,9 +21,9 @@ Cargo enables the complete `runtime` feature by default. The build script builds
 
 The menu startup harness is `native/tests/menu_startup.m`, compiled as `build/menu-startup-test` and run automatically during `sh scripts/build-native.sh`. It checks registered custom config paths, malformed registrations, precise process identity matching, and preservation of the previous menu's arguments during handoff. Its subprocesses and files are temporary test fixtures; it does not stop the installed menu.
 
-`native/tests/test_installed_runtime.py` exercises the real bundled `run` command with owned native menu fixtures. It verifies separate process sessions, menu survival across worker termination, child reaping, singleton behavior and that manual `watch` opens no GUI. The native build script runs it against the release app; CI also runs it against the debug CLI. `native/tests/installer.m` checks graphical installation planning and bounded Trash handling. `native/tests/test_installer_package.py` mounts a generated DMG read-only and verifies its payload and metadata without registering live jobs.
+`native/tests/test_installed_runtime.py` exercises the real bundled `run` command with owned native menu fixtures. It verifies separate process sessions, menu survival across worker termination, child reaping, singleton behavior and that manual `watch` opens no GUI. The native build script runs it against the app's ad hoc signed Rust executable; CI also runs it against the debug CLI. `native/tests/installer.m` checks graphical installation planning and bounded Trash handling. `native/tests/test_installer_package.py` mounts a generated DMG read-only and verifies its payload and metadata without registering live jobs.
 
-The trampoline suite builds temporary bundles and checks same-process GUI dispatch, explicit CLI isolation, metadata validation, executable validation, and malformed bundle rejection. The release build runs it again against the packaged Rust executable. These fixtures do not change Full Disk Access or verify a live worker permission grant.
+The trampoline suite builds temporary bundles and checks same-process GUI dispatch, explicit CLI isolation, metadata validation, executable validation, and malformed bundle rejection. The release build runs the trampoline and installed-runtime suites before applying the final Developer ID signature, then verifies that signature and runs `--version`, `--help`, and `native/tests/test_workspace_cli.py` against the intact signed app. The workspace suite executes the binary in place with temporary workspace and state files; it does not modify the app bundle, and its failure stops the release build. Local mode retains all three suites in the same order with an ad hoc signature. These fixtures do not change Full Disk Access or verify a live worker permission grant.
 
 The retained Python suite checks earlier behavior and compatibility formats:
 
@@ -31,6 +32,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 CI runs native checks and app-bundle construction, including the menu startup harness, on `macos-latest`. Separate Python compatibility jobs use Python 3.11 and 3.14. A successful CI bundle build establishes neither notarization nor permission to access protected user folders.
+
+Both build scripts default to local mode: an ad hoc signature, a `-local` DMG name, and no Apple credentials. The explicit `--release` mode signs with a Developer ID Application identity and notarizes and staples the payload app and the DMG; its inputs `JASO_SIGNING_IDENTITY`, `JASO_TEAM_ID`, and `JASO_NOTARY_PROFILE`, the signing sequence, and the acceptance checklist are in [Release signing and notarization](releasing.md). `python3 native/tests/test_release_signing.py` exercises the release preflight and sequencing with stubbed signing and notary tools; it needs no certificate or notary profile, and passing it is not evidence that a real artifact was signed or accepted. Pull request and CI builds never receive signing credentials.
 
 ## Filesystem fixtures
 

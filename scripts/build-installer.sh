@@ -2,18 +2,78 @@
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
+release=0
+app_dir=
+usage() { echo 'Usage: build-installer.sh [--release] [--app BUILT_APP]' >&2; exit 2; }
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --release) test "$release" = 0 || usage; release=1; shift ;;
+        --app) test "$#" -ge 2 && test -z "$app_dir" && test -n "$2" || usage
+               app_dir=$(CDPATH= cd -- "$2" && pwd); shift 2 ;;
+        *) usage ;;
+    esac
+done
 test "$(uname -s)" = Darwin || { echo 'The installer requires macOS.' >&2; exit 1; }
-case "$#" in
-    0) sh scripts/build-native.sh; app_dir="$project_dir/dist/Jaso NFC.app" ;;
-    2) test "$1" = --app || { echo 'Usage: build-installer.sh [--app BUILT_APP]' >&2; exit 2; }
-       app_dir=$(CDPATH= cd -- "$2" && pwd) ;;
-    *) echo 'Usage: build-installer.sh [--app BUILT_APP]' >&2; exit 2 ;;
-esac
-codesign --verify --deep --strict "$app_dir"
-JASO_RELEASE_APP="$app_dir" python3 native/tests/test_release_metadata.py
+if [ "$release" = 1 ]; then
+    python3 scripts/release_signing.py preflight --notary
+fi
+if [ -z "$app_dir" ]; then
+    if [ "$release" = 1 ]; then
+        sh scripts/build-native.sh --release
+    else
+        sh scripts/build-native.sh
+    fi
+    app_dir="$project_dir/dist/Jaso NFC.app"
+fi
 mkdir -p "$project_dir/build" "$project_dir/dist"
 stage_dir=$(mktemp -d "$project_dir/build/installer.XXXXXX")
-trap 'rm -rf "$stage_dir"' EXIT HUP INT TERM
+publish_backup=
+publish_active=0
+previous_pair=0
+rollback_publication() {
+    # Backups remain intact until BOTH old names have been restored. Hard links
+    # keep restoration on the dist filesystem and never copy partial file bytes.
+    rm -f "$final_dmg" "$final_checksum" || return 1
+    if [ "$previous_pair" = 1 ]; then
+        if ln "$publish_backup/$dmg_name" "$final_dmg" &&
+           ln "$publish_backup/$dmg_name.sha256" "$final_checksum"; then
+            return 0
+        fi
+        rm -f "$final_dmg" "$final_checksum"
+        return 1
+    fi
+    return 0
+}
+cleanup() {
+    result=$?
+    trap - EXIT
+    # A second handled signal must not interrupt rollback or discard its backup.
+    trap '' HUP INT TERM
+    if [ "$publish_active" = 1 ] && ! rollback_publication; then
+        printf 'Publication rollback failed; recovery files retained at: %s\n' "$publish_backup" >&2
+        publish_backup=
+        result=1
+    fi
+    if [ -n "$publish_backup" ]; then
+        rm -rf "$publish_backup" || printf 'Publication backup retained at: %s\n' "$publish_backup" >&2
+    fi
+    rm -rf "$stage_dir"
+    exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+if [ "$release" = 1 ]; then
+    # Never sign or staple a caller's --app. Finish the payload before embedding it.
+    ditto "$app_dir" "$stage_dir/Jaso NFC.app"
+    app_dir="$stage_dir/Jaso NFC.app"
+    JASO_RELEASE_APP="$app_dir" python3 native/tests/test_release_metadata.py
+    python3 scripts/release_signing.py sign payload "$app_dir"
+    receipts_dir=$(mktemp -d "$project_dir/build/notary.XXXXXX")
+    python3 scripts/release_signing.py notarize payload "$app_dir" "$receipts_dir/payload"
+else
+    codesign --verify --deep --strict "$app_dir"
+    JASO_RELEASE_APP="$app_dir" python3 native/tests/test_release_metadata.py
+fi
 volume_dir="$stage_dir/volume"
 installer_app="$volume_dir/Install Jaso NFC.app"
 mkdir -p "$installer_app/Contents/MacOS" "$installer_app/Contents/Resources"
@@ -83,17 +143,53 @@ https://garlicvread.github.io/jaso-nfc/
 Copyright 2026 jaso-nfc contributors. License: MIT (see LICENSE.txt).
 
 TXT
-codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc.installer "$installer_app"
-codesign --verify --deep --strict "$installer_app"
-version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_dir/Contents/Info.plist")
+if [ "$release" = 1 ]; then
+    python3 scripts/release_signing.py sign installer "$installer_app"
+else
+    codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc.installer "$installer_app"
+    codesign --verify --deep --strict "$installer_app"
+fi
+version=$(python3 -c 'import plistlib, sys; print(plistlib.load(open(sys.argv[1], "rb"))["CFBundleShortVersionString"])' "$app_dir/Contents/Info.plist")
 architecture=$(lipo -archs "$app_dir/Contents/MacOS/jaso-nfc" | tr ' ' '-')
 case "$version-$architecture" in *[!0-9A-Za-z.-]*) echo 'Invalid package version or architecture.' >&2; exit 1 ;; esac
-dmg_path="$project_dir/dist/Jaso-NFC-$version-$architecture-local.dmg"
-hdiutil create -quiet -ov -format UDZO -fs HFS+ -volname "Jaso NFC $version Installer" -srcfolder "$volume_dir" "$stage_dir/installer.dmg"
-mv "$stage_dir/installer.dmg" "$dmg_path"
+suffix=-local
+if [ "$release" = 1 ]; then suffix=; fi
+dmg_name="Jaso-NFC-$version-$architecture$suffix.dmg"
+dmg_path="$stage_dir/$dmg_name"
+hdiutil create -quiet -ov -format UDZO -fs HFS+ -volname "Jaso NFC $version Installer" -srcfolder "$volume_dir" "$dmg_path"
+if [ "$release" = 1 ]; then
+    python3 scripts/release_signing.py sign dmg "$dmg_path"
+    python3 scripts/release_signing.py notarize dmg "$dmg_path" "$receipts_dir/dmg"
+fi
 (
-    cd "$project_dir/dist"
-    shasum -a 256 "${dmg_path##*/}" > "${dmg_path##*/}.sha256"
+    cd "$stage_dir"
+    shasum -a 256 "$dmg_name" > "$dmg_name.sha256"
 )
-JASO_INSTALLER_DMG="$dmg_path" JASO_INSTALLER_PAYLOAD="$app_dir" python3 native/tests/test_installer_package.py
-printf '%s\n' "$dmg_path"
+JASO_INSTALLER_DMG="$dmg_path" JASO_INSTALLER_PAYLOAD="$app_dir" JASO_RELEASE_MODE="$release" python3 native/tests/test_installer_package.py
+# Publishable names are only populated after every packaging/release check passes.
+final_dmg="$project_dir/dist/$dmg_name"
+final_checksum="$final_dmg.sha256"
+test ! -L "$project_dir/dist" || { echo 'Publication dist must not be a symlink.' >&2; exit 1; }
+for final in "$final_dmg" "$final_checksum"; do
+    if [ -L "$final" ] || { [ -e "$final" ] && [ ! -f "$final" ]; }; then
+        printf 'Publication requires a regular file or absent path: %s\n' "$final" >&2
+        exit 1
+    fi
+done
+if [ -f "$final_dmg" ] && [ -f "$final_checksum" ]; then
+    previous_pair=1
+elif [ -e "$final_dmg" ] || [ -e "$final_checksum" ]; then
+    echo 'Publication requires both prior files or neither; incomplete outputs were preserved.' >&2
+    exit 1
+fi
+publish_backup=$(mktemp -d "$project_dir/dist/.installer-publish.XXXXXX")
+if [ "$previous_pair" = 1 ]; then
+    ln "$final_dmg" "$publish_backup/$dmg_name"
+    ln "$final_checksum" "$publish_backup/$dmg_name.sha256"
+fi
+# Arm rollback BEFORE any final-name mutation, including the first move.
+publish_active=1
+mv -f "$dmg_path.sha256" "$final_checksum"
+mv -f "$dmg_path" "$final_dmg"
+publish_active=0
+printf '%s\n' "$final_dmg"

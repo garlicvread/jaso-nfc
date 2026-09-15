@@ -2,12 +2,23 @@
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
+release=0
+case "$#" in
+    0) ;;
+    1) test "$1" = --release || { echo 'Usage: build-native.sh [--release]' >&2; exit 2; }
+       release=1 ;;
+    *) echo 'Usage: build-native.sh [--release]' >&2; exit 2 ;;
+esac
 test "$(uname -s)" = Darwin || { echo 'The native application requires macOS.' >&2; exit 1; }
+if [ "$release" = 1 ]; then
+    python3 scripts/release_signing.py preflight
+fi
 cargo build --release --features runtime --locked
 app_dir="$project_dir/dist/Jaso NFC.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources" "$project_dir/build"
 cp target/release/jaso-nfc "$app_dir/Contents/MacOS/jaso-nfc"
 cp native/macos/Info.plist "$app_dir/Contents/Info.plist"
+cp LICENSE "$app_dir/Contents/Resources/LICENSE.txt"
 clang -Os -fobjc-arc -mmacosx-version-min=13.0 -framework AppKit -framework QuartzCore -framework CoreText -framework ImageIO native/macos/Menu.m native/macos/WorkspaceWindow.m native/macos/NamePresentation.m native/macos/AnimatedMark.m native/macos/ContentZoom.m native/macos/StatusWindow.m native/macos/StatusPresentation.m native/macos/Localization.m native/macos/SettingsWindow.m native/macos/SetupWindow.m -o "$app_dir/Contents/MacOS/Jaso NFC"
 clang -Os -fobjc-arc -mmacosx-version-min=13.0 -framework AppKit -framework QuartzCore -framework CoreText -framework ImageIO native/macos/RenderIcon.m native/macos/AnimatedMark.m -o "$project_dir/build/RenderIcon"
 clang -O0 -g -fobjc-arc -mmacosx-version-min=13.0 -framework AppKit -framework QuartzCore -framework CoreText -framework ImageIO native/tests/menu_startup.m native/macos/WorkspaceWindow.m native/macos/NamePresentation.m native/macos/AnimatedMark.m native/macos/ContentZoom.m native/macos/StatusWindow.m native/macos/StatusPresentation.m native/macos/Localization.m native/macos/SettingsWindow.m native/macos/SetupWindow.m -o "$project_dir/build/menu-startup-test"
@@ -47,11 +58,20 @@ iconutil -c icns "$project_dir/build/JasoNFC.iconset" -o "$app_dir/Contents/Reso
 if [ -n "${JASO_ICON_PREVIEW_DIR:-}" ]; then
     "$project_dir/build/RenderIcon" --preview "$JASO_ICON_PREVIEW_DIR"
 fi
-# Sign nested code first, then let the app signature cover its Rust main.
+# The next two suites copy executables and rewrite bundle metadata, so run them
+# with the local ad hoc signature before sealing the release with Developer ID.
 codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc.menu "$app_dir/Contents/MacOS/Jaso NFC"
 codesign --force --sign - --identifier io.github.garlicvread.jaso-nfc "$app_dir"
 codesign --verify --deep --strict "$app_dir"
 JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_app_trampoline.py
 JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_installed_runtime.py
+if [ "$release" = 1 ]; then
+    # The helper signs nested code first, then the app, and verifies the final
+    # signer, team, hardened runtime and secure timestamps. Smoke the intact app.
+    python3 scripts/release_signing.py sign payload "$app_dir"
+    "$app_dir/Contents/MacOS/jaso-nfc" --version
+    "$app_dir/Contents/MacOS/jaso-nfc" --help
+fi
+# Workspace checks execute the intact binary in place, after final release signing.
 JASO_NATIVE_BINARY="$app_dir/Contents/MacOS/jaso-nfc" python3 native/tests/test_workspace_cli.py
 printf '%s\n' "$app_dir"
